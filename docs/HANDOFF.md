@@ -1,4 +1,4 @@
-# HANDOFF — Milestone 0
+# HANDOFF
 
 ## Status
 M0 (audit and docs only) done. Nothing compiled or run. No game/build files changed.
@@ -37,3 +37,25 @@ Commit hash: see `git log -1` on `pico4-development` (single M0 docs commit).
 
 ## Next
 M1: reproducible debug APK build (GitHub Actions or a cloud session with SDK/NDK), fixing only what blocks compilation.
+
+---
+
+## Milestone 1A — CI build infrastructure
+- Branch: `pico4-m1-build` (from master after PR #1 merge `81a5e16`). PR/commit: see the M1A pull request on GitHub.
+- Files: added `.github/workflows/android-debug.yml`, `docs/PICO4_BUILD_ZH.md`; updated this file. No source/Gradle/manifest changes.
+- Workflow: `workflow_dispatch` only; ubuntu-24.04; 45 min timeout; `contents: read`; JDK 17 (Temurin), SDK platform 32, build-tools 34.0.0, NDK 25.1.8937393 via sdkmanager; CI-only `local.properties`; `./gradlew assembleDebug` (runs existing `extractOpenXrLoader`, `packResources`, ndk-build); then APK validation, SHA-256, 2-day artifact `RTCWQuest-PICO4-Debug-ARM64`.
+- Build-tools 34.0.0 is the AGP 8.2.1 default (assumed; not pinned in repo).
+- **Compilation executed: NO.** Workflow only statically checked (YAML parses). Not run in Actions yet.
+
+### Confirmed from source in M1A
+- Java loads `openxr_loader` (try block) then `rtcw_client` (`GLES3JNIActivity.java:56,60`). The manifest `android.app.lib_name=rtcwquest` is NativeActivity metadata; the activity is a plain `Activity`, so it appears unused (resolves the M0 question; runtime effect not tested).
+- Shared libs expected in APK `lib/arm64-v8a/`: `librtcw_client`, `libgl4es`, `libqagame`, `libcgame`, `libui`, `libopenxr_loader`, `libc++_shared` (all modules are `BUILD_SHARED_LIBRARY`; STL c++_shared).
+- `gradlew` is committed as mode 644; CI runs `chmod +x`.
+- `local.properties` is tracked (Windows path); CI overwrites it in the workspace only.
+- `z_vr_assets.pk3` is generated (not tracked) by `packResources`; the validator checks for `assets/z_vr_assets.pk3`.
+
+### Unverified risks
+`APP_ALLOW_MISSING_DEPS=true`, `USE_ASAN=1` (no .mk uses it), support-compat 28.0.0, debug keystore, Quest-only `supportedDevices`. First real build may reveal more.
+
+### Next session
+Owner merges PR and runs workflow (Actions > Android Debug APK > Run workflow). Then M1B: read logs, fix only compile/packaging errors, update this file.

@@ -1,0 +1,115 @@
+name: Android Debug APK
+
+# Manual trigger only. No push, pull_request or schedule triggers.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-debug-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ANDROID_PLATFORM: "platforms;android-32"
+  ANDROID_BUILD_TOOLS: "build-tools;34.0.0"
+  ANDROID_NDK_VERSION: "25.1.8937393"
+  APK_DIR: Projects/Android/build/outputs/apk/debug
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android command-line tools
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ""
+
+      - name: Install SDK platform, build-tools and NDK
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "${ANDROID_PLATFORM}" "${ANDROID_BUILD_TOOLS}" "ndk;${ANDROID_NDK_VERSION}" "platform-tools"
+          test -d "${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}"
+
+      - name: Write CI-only local.properties
+        working-directory: Projects/Android
+        run: |
+          set -euo pipefail
+          # Overwrites the committed Windows path in this CI workspace only.
+          printf 'sdk.dir=%s\nndk.dir=%s\n' "${ANDROID_HOME}" "${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}" > local.properties
+
+      - name: Build debug APK (existing Gradle + ndk-build chain)
+        working-directory: Projects/Android
+        run: |
+          chmod +x gradlew
+          # Runs extractOpenXrLoader, packResources and ndk-build via the project's own tasks.
+          ./gradlew --no-daemon --max-workers=2 assembleDebug --stacktrace
+
+      - name: Locate APK
+        id: apk
+        run: |
+          set -euo pipefail
+          APK=$(ls "${APK_DIR}"/*.apk 2>/dev/null | head -n 1 || true)
+          if [ -z "${APK}" ]; then echo "::error::No debug APK produced in ${APK_DIR}"; exit 1; fi
+          echo "path=${APK}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate APK
+        env:
+          APK: ${{ steps.apk.outputs.path }}
+        run: |
+          set -euo pipefail
+          unzip -tq "${APK}"
+          AAPT2=$(ls "${ANDROID_HOME}"/build-tools/*/aapt2 | tail -n 1)
+          "${AAPT2}" dump badging "${APK}" > badging.txt
+          grep -m1 "^package:" badging.txt
+          grep -q "name='com.drbeef.rtcwquest'" badging.txt || { echo "::error::Unexpected package name"; exit 1; }
+          unzip -Z1 "${APK}" > entries.txt
+          grep '^lib/' entries.txt
+          if grep '^lib/' entries.txt | grep -v '^lib/arm64-v8a/'; then
+            echo "::error::Non arm64-v8a native entries found"; exit 1
+          fi
+          # Library names verified from jni/Android.mk, Application.mk and GLES3JNIActivity.java
+          for lib in librtcw_client.so libgl4es.so libqagame.so libcgame.so libui.so libopenxr_loader.so libc++_shared.so; do
+            grep -qx "lib/arm64-v8a/${lib}" entries.txt || { echo "::error::Missing ${lib}"; MISSING=1; }
+          done
+          [ -z "${MISSING:-}" ]
+          grep -qx 'assets/z_vr_assets.pk3' entries.txt || { echo "::error::z_vr_assets.pk3 missing from APK"; exit 1; }
+
+      - name: Checksum and run summary
+        env:
+          APK: ${{ steps.apk.outputs.path }}
+        run: |
+          set -euo pipefail
+          SHA=$(sha256sum "${APK}" | cut -d' ' -f1)
+          SIZE=$(stat -c %s "${APK}")
+          {
+            echo "## Debug APK built"
+            echo "- File: \`$(basename "${APK}")\`"
+            echo "- Size: ${SIZE} bytes"
+            echo "- SHA-256: \`${SHA}\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Build success is NOT evidence of PICO 4 runtime compatibility."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "${SHA}  $(basename "${APK}")" > "${APK}.sha256"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RTCWQuest-PICO4-Debug-ARM64
+          path: |
+            ${{ steps.apk.outputs.path }}
+            ${{ steps.apk.outputs.path }}.sha256
+          retention-days: 2
+          if-no-files-found: error
