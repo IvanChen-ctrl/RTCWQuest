@@ -1,0 +1,29 @@
+name: Input Host Tests
+
+# Fast host-side tests for the controller input logic and diagnostics
+# (tests/vr_input).  No Android SDK/NDK needed; runs in a few seconds.
+# This does NOT replace the Android Debug APK build and proves nothing about
+# runtime behaviour on a headset.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'tests/vr_input/**'
+      - 'Projects/Android/jni/RTCWVR/VrInputLogic.h'
+      - 'Projects/Android/jni/RTCWVR/VrInputDiag.c'
+      - 'Projects/Android/jni/RTCWVR/VrInputDiag.h'
+      - '.github/workflows/input-host-tests.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and run host tests
+        run: make -C tests/vr_input test

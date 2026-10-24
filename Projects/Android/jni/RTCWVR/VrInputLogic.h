@@ -1,0 +1,139 @@
+/*
+===========================================================================
+VrInputLogic.h -- pure controller input logic (no OpenXR, no engine types).
+
+Everything here is a small static inline function so the exact code that runs
+on the headset can also be compiled and unit tested on a host machine
+(see tests/vr_input).  Keep this header free of engine and Android includes.
+===========================================================================
+*/
+
+#ifndef VRINPUTLOGIC_H
+#define VRINPUTLOGIC_H
+
+#include <stdint.h>
+
+#define VRI_HAND_LEFT   0
+#define VRI_HAND_RIGHT  1
+
+/* Button bits.  These MUST equal the xrButton_* / ovrButton_* values used by
+ * the rest of the VR layer; OpenXrInput.c asserts that at compile time. */
+#define VRI_BTN_A           0x00000001u
+#define VRI_BTN_B           0x00000002u
+#define VRI_BTN_RTHUMB      0x00000004u
+#define VRI_BTN_X           0x00000100u
+#define VRI_BTN_Y           0x00000200u
+#define VRI_BTN_LTHUMB      0x00000400u
+#define VRI_BTN_ENTER       0x00100000u
+#define VRI_BTN_GRIP        0x04000000u
+#define VRI_BTN_TRIGGER     0x20000000u
+#define VRI_BTN_JOYSTICK    0x80000000u
+
+/* Analog press threshold shared by the trigger and the grip. */
+#define VRI_ANALOG_THRESHOLD 0.5f
+
+/* Raw per-hand values as read from the OpenXR actions. */
+typedef struct {
+    int   menu;        /* menu click (left hand on most profiles)            */
+    int   face1;       /* X on the left hand, A on the right hand            */
+    int   face2;       /* Y on the left hand, B on the right hand            */
+    int   stickClick;  /* thumbstick click                                   */
+    float grip;        /* squeeze value (or 0/1 for click-only profiles)     */
+    float trigger;     /* trigger value                                      */
+    int   select;      /* khr/simple_controller select click                 */
+} vrRawHandInput_t;
+
+/* The khr/simple_controller profile has no analog trigger.  Its select click
+ * stands in for a fully pulled trigger so the controller stays usable. */
+static inline float VrInput_EffectiveTrigger(const vrRawHandInput_t *raw)
+{
+    if (raw->select && raw->trigger < 1.0f) {
+        return 1.0f;
+    }
+    return raw->trigger;
+}
+
+static inline uint32_t VrInput_ComposeButtons(int hand, const vrRawHandInput_t *raw)
+{
+    uint32_t b = 0;
+
+    if (raw->menu) {
+        b |= VRI_BTN_ENTER;
+    }
+    if (raw->face1) {
+        b |= (hand == VRI_HAND_LEFT) ? VRI_BTN_X : VRI_BTN_A;
+    }
+    if (raw->face2) {
+        b |= (hand == VRI_HAND_LEFT) ? VRI_BTN_Y : VRI_BTN_B;
+    }
+    if (raw->stickClick) {
+        b |= ((hand == VRI_HAND_LEFT) ? VRI_BTN_LTHUMB : VRI_BTN_RTHUMB) | VRI_BTN_JOYSTICK;
+    }
+    if (raw->grip > VRI_ANALOG_THRESHOLD) {
+        b |= VRI_BTN_GRIP;
+    }
+    if (VrInput_EffectiveTrigger(raw) > VRI_ANALOG_THRESHOLD) {
+        b |= VRI_BTN_TRIGGER;
+    }
+    return b;
+}
+
+/* Edge of one button between two button masks: 1 = pressed, 0 = released,
+ * -1 = no change. */
+static inline int VrInput_ButtonEdge(uint32_t newButtons, uint32_t oldButtons, uint32_t mask)
+{
+    uint32_t n = newButtons & mask;
+    uint32_t o = oldButtons & mask;
+    if (n == o) {
+        return -1;
+    }
+    return n != 0;
+}
+
+/* Menu cursor hand selection.  Mirrors the original condition
+ * "controlsLeftHanded == menu_right_handed": when true the OFF hand drives the
+ * menu cursor, otherwise the DOMINANT hand does. */
+static inline int VrInput_MenuUsesOffhand(int controlsLeftHanded, int menuRightHanded)
+{
+    return (controlsLeftHanded != 0) == (menuRightHanded != 0);
+}
+
+/* Physical hand (VRI_HAND_*) that drives the menu cursor and clicks. */
+static inline int VrInput_MenuCursorHand(int controlsLeftHanded, int menuRightHanded, int playerRightHanded)
+{
+    int dominant = playerRightHanded ? VRI_HAND_RIGHT : VRI_HAND_LEFT;
+    if (VrInput_MenuUsesOffhand(controlsLeftHanded, menuRightHanded)) {
+        return (dominant == VRI_HAND_RIGHT) ? VRI_HAND_LEFT : VRI_HAND_RIGHT;
+    }
+    return dominant;
+}
+
+typedef struct {
+    int key;
+    int down;
+} vrKeyEvent_t;
+
+/* Menu click generation for one hand: the confirm face button and the trigger
+ * both produce the mouse key.  Returns the number of events written to out[]
+ * (at most 2), in the same order the engine receives them. */
+static inline int VrInput_MenuClickEvents(uint32_t newButtons, uint32_t oldButtons,
+                                          uint32_t confirmMask, uint32_t triggerMask,
+                                          int mouseKey, vrKeyEvent_t out[2])
+{
+    int count = 0;
+    int edge = VrInput_ButtonEdge(newButtons, oldButtons, confirmMask);
+    if (edge >= 0) {
+        out[count].key = mouseKey;
+        out[count].down = edge;
+        count++;
+    }
+    edge = VrInput_ButtonEdge(newButtons, oldButtons, triggerMask);
+    if (edge >= 0) {
+        out[count].key = mouseKey;
+        out[count].down = edge;
+        count++;
+    }
+    return count;
+}
+
+#endif /* VRINPUTLOGIC_H */
