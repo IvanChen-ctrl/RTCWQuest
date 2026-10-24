@@ -536,11 +536,19 @@ static int VrMerc_TryHire( gentity_t *player ) {
 	vrMercHireContext_t ctx;
 	vec3_t pos;
 	int result;
+	gentity_t *orphan;
 
 	VrMerc_BuildHireContext( player, &ctx );
 	result = VrMerc_CanHire( &ctx );
 	if ( result != VRMERC_HIRE_OK ) {
 		return result;
+	}
+	// a character from an earlier request that finished after we gave up on it: take it over
+	// instead of creating a second one
+	orphan = VrMerc_FindNewCompanion();
+	if ( orphan ) {
+		VrMerc_Adopt( player, orphan );
+		return VRMERC_HIRE_OK;
 	}
 	if ( !VrMerc_FindSpawnPos( player, pos ) ) {
 		return VRMERC_HIRE_NO_SPAWN_POINT;
