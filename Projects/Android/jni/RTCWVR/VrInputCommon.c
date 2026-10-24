@@ -8,17 +8,43 @@ Authors		:	Simon Brown
 *************************************************************************************/
 
 #include "VrInput.h"
+#include "VrInputLogic.h"
+#include "VrInputDiag.h"
 
 #include <src/qcommon/qcommon.h>
 
 //keys.h
 void Sys_QueEvent( int time, sysEventType_t type, int value, int value2, int ptrLength, void *ptr );
+
+static int handIndexOf(const ovrInputStateTrackedRemote * trackedRemoteState)
+{
+    if (trackedRemoteState == &leftTrackedRemoteState_new) return VRI_HAND_LEFT;
+    if (trackedRemoteState == &rightTrackedRemoteState_new) return VRI_HAND_RIGHT;
+    return -1;
+}
+
 void handleTrackedControllerButton(ovrInputStateTrackedRemote * trackedRemoteState, ovrInputStateTrackedRemote * prevTrackedRemoteState, uint32_t button, int key)
 {
-    if ((trackedRemoteState->Buttons & button) != (prevTrackedRemoteState->Buttons & button))
+    int edge = VrInput_ButtonEdge(trackedRemoteState->Buttons, prevTrackedRemoteState->Buttons, button);
+    if (edge >= 0)
     {
-        Sys_QueEvent( 0, SE_KEY, key, (trackedRemoteState->Buttons & button) != 0, 0, NULL );
+        Sys_QueEvent( 0, SE_KEY, key, edge, 0, NULL );
+        VrInputDiag_KeyGenerated( handIndexOf(trackedRemoteState), key, edge );
 //        Key_Event(key, (trackedRemoteState->Buttons & button) != 0, global_time);
+    }
+}
+
+// Menu click for one hand: the confirm face button and the trigger both press
+// the mouse key (same behaviour as two handleTrackedControllerButton calls).
+void handleMenuClick(ovrInputStateTrackedRemote * trackedRemoteState, ovrInputStateTrackedRemote * prevTrackedRemoteState, uint32_t confirmButton, int mouseKey)
+{
+    vrKeyEvent_t events[2];
+    int count = VrInput_MenuClickEvents(trackedRemoteState->Buttons, prevTrackedRemoteState->Buttons,
+                                        confirmButton, ovrButton_Trigger, mouseKey, events);
+    for (int i = 0; i < count; i++)
+    {
+        Sys_QueEvent( 0, SE_KEY, events[i].key, events[i].down, 0, NULL );
+        VrInputDiag_KeyGenerated( handIndexOf(trackedRemoteState), events[i].key, events[i].down );
     }
 }
 

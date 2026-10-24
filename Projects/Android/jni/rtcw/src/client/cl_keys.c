@@ -1638,10 +1638,13 @@ Called by the system for both key up and key down events
 ===================
 */
 //static int consoleCount = 0; // TTimo: unused
+void VrInputDiag_KeyDelivered( int key, int down, int keyCatchers ); // VR input diagnostics (RTCWVR/VrInputDiag.c)
 void CL_KeyEvent( int key, qboolean down, unsigned time ) {
 	char    *kb;
 	char cmd[1024];
 	int activeMenu = 0;
+
+	VrInputDiag_KeyDelivered( key, down, cls.keyCatchers );
 
 	// update auto-repeat status and BUTTON_ANY status
 	keys[key].down = down;

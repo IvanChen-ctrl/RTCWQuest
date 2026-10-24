@@ -203,6 +203,7 @@ RTCWVR_SRC_FILES :=  ../RTCWVR/RTCWVR_SurfaceView.c \
        ../RTCWVR/TBXR_Common.c \
        ../RTCWVR/OpenXrInput.c \
        ../RTCWVR/VrInputCommon.c \
+       ../RTCWVR/VrInputDiag.c \
        ../RTCWVR/VrInputWeaponAlign.c \
        ../RTCWVR/VrInputDefault.c \
        ../RTCWVR/mathlib.c \

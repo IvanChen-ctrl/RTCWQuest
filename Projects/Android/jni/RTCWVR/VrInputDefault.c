@@ -11,6 +11,8 @@ Authors		:	Simon Brown
 
 #include "VrInput.h"
 #include "VrCvars.h"
+#include "VrInputLogic.h"
+#include "VrInputDiag.h"
 
 #include <src/qcommon/qcommon.h>
 #include <src/client/client.h>
@@ -127,18 +129,18 @@ void HandleInput_Default( ovrInputStateGamepad *pFootTrackingNew, ovrInputStateG
     if ( RTCWVR_useScreenLayer() )
     {
         bool controlsLeftHanded = vr_control_scheme->integer >= 10;
-        if (controlsLeftHanded == vr.menu_right_handed) {
+        VrInputDiag_MenuHand(VrInput_MenuCursorHand(controlsLeftHanded, vr.menu_right_handed, vr.right_handed),
+                             vr.menu_right_handed, controlsLeftHanded, 1);
+        if (VrInput_MenuUsesOffhand(controlsLeftHanded, vr.menu_right_handed)) {
             interactWithTouchScreen(menuYaw, vr.offhandangles);
-            handleTrackedControllerButton(pOffTrackedRemoteNew, pOffTrackedRemoteOld, offButton1, K_MOUSE1);
-            handleTrackedControllerButton(pOffTrackedRemoteNew, pOffTrackedRemoteOld, ovrButton_Trigger, K_MOUSE1);
+            handleMenuClick(pOffTrackedRemoteNew, pOffTrackedRemoteOld, offButton1, K_MOUSE1);
             if ((pDominantTrackedRemoteNew->Buttons & ovrButton_Trigger) != (pDominantTrackedRemoteOld->Buttons & ovrButton_Trigger) && (pDominantTrackedRemoteNew->Buttons & ovrButton_Trigger)) {
                 vr.menu_right_handed = !vr.menu_right_handed;
                 RTCWVR_Vibrate(40, vr.menu_right_handed ? 1 : 0, 0.5);
             }
         } else {
             interactWithTouchScreen(menuYaw, vr.dominanthandangles);
-            handleTrackedControllerButton(pDominantTrackedRemoteNew, pDominantTrackedRemoteOld, domButton1, K_MOUSE1);
-            handleTrackedControllerButton(pDominantTrackedRemoteNew, pDominantTrackedRemoteOld, ovrButton_Trigger, K_MOUSE1);
+            handleMenuClick(pDominantTrackedRemoteNew, pDominantTrackedRemoteOld, domButton1, K_MOUSE1);
             if ((pOffTrackedRemoteNew->Buttons & ovrButton_Trigger) != (pOffTrackedRemoteOld->Buttons & ovrButton_Trigger) && (pOffTrackedRemoteNew->Buttons & ovrButton_Trigger)) {
                 vr.menu_right_handed = !vr.menu_right_handed;
                 RTCWVR_Vibrate(40, vr.menu_right_handed ? 1 : 0, 0.5);

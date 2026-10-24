@@ -1,7 +1,10 @@
 # HANDOFF
 
-## Status
-M0 (audit and docs only) done. Nothing compiled or run. No game/build files changed.
+## Status (updated in M2A — read "Milestone 2A" at the bottom first)
+M0 (audit/docs) and M1A (CI workflow) are merged to `master` (PR #1, PR #2). The Actions build has succeeded twice.
+First real PICO 4 run: app starts, renders the menu, right controller moves the cursor with hover haptics, but no
+controller button activates anything. M2A (branch `claude/elegant-bardeen-ykx27m`) investigates and addresses that;
+it is NOT verified on hardware yet. The M0 and M1A sections below are kept as history and are partly stale.
 
 ## Start point
 - Upstream state: `master` @ `4c714b9163b0de94a856ac896c6cfa56a283de74` ("Fix Tesla and a Quest Permission Issue")
@@ -26,8 +29,8 @@ Retail RTCW pk3 files are required at runtime in `/sdcard/RTCWQuest/Main` (not i
 - `support-compat:28.0.0` is an old support-library dependency (not AndroidX).
 - Manifest `supportedDevices` lists Quest only; effect on PICO 4 UNVERIFIED (likely ignored).
 - `fileTree(libs)` includes `haptic_service.aar`; its role on PICO unverified.
-- No `.github/` directory, no CI.
-- Whether it builds at all: UNVERIFIED.
+- (Stale since M1A) ~~No `.github/` directory, no CI.~~ `.github/workflows/android-debug.yml` exists.
+- (Stale since M1B) ~~Whether it builds at all: UNVERIFIED.~~ VERIFIED: the Actions workflow built the APK twice.
 
 ## M0 files created
 `CLAUDE.md`, `docs/HANDOFF.md`, `docs/PICO4_BUILD_AUDIT.md` (no other files modified).
@@ -59,3 +62,88 @@ M1: reproducible debug APK build (GitHub Actions or a cloud session with SDK/NDK
 
 ### Next session
 Owner merges PR and runs workflow (Actions > Android Debug APK > Run workflow). Then M1B: read logs, fix only compile/packaging errors, update this file.
+
+---
+
+## Milestone 1B — build verification (observed on GitHub, 2026-10)
+- [Run #1](https://github.com/IvanChen-ctrl/RTCWQuest/actions/runs/39833618907) (2026-10-22) and
+  [run #2](https://github.com/IvanChen-ctrl/RTCWQuest/actions/runs/40127569323) (2026-10-24): workflow `Android Debug APK`,
+  `workflow_dispatch` on `master` @ `2500dd2`, both **conclusion: success**. VERIFIED (read from the Actions API).
+- Which of the two runs produced the APK that was installed on the headset is **not verified**. Artifacts expire
+  after 2 days. M2A's test plan records the SHA-256 so future tests are traceable.
+
+## Milestone 2A — controller button diagnosis and repair
+
+### Confirmed observations (first real PICO 4 test, Windows Feedback Bridge v0.2)
+- Original PICO 4 (A8110, Android 10, firmware 5.13.7), RTCWQuest 1.5.0 (versionCode 53), debug APK from Actions.
+- App runs, renders the RTCW main menu, no crash in the ~10 s capture.
+- Right controller moves the menu cursor; hovering menu text triggers haptics.
+- Tested physical buttons on both controllers do not activate or confirm any menu item.
+- Existing logs contain `Menu_HandleMouseMove` / `Item_SetFocus` but no explicit button-action logging, so absence of
+  button logs is NOT proof that no events were generated. Android screenshots were black (video was fine).
+
+### Traced in source (VERIFIED by reading code; not run on hardware)
+Path: OpenXR profile -> `xrSuggestInteractionProfileBindings` -> `xrSyncActions` -> `xrGetActionState*` ->
+`ovrInputStateTrackedRemote.Buttons` (`OpenXrInput.c`) -> `handleTrackedControllerButton` / `VrInputDefault.c` menu
+branch -> `Sys_QueEvent(SE_KEY, K_MOUSE1)` -> `CL_KeyEvent` -> `UI_KEY_EVENT` -> `Menu_HandleKey`.
+- Cursor and haptics only need the pose and haptic bindings. Button input needs the trigger/face-button bindings.
+  So "pose + haptics work, buttons do not" is consistent with the pose/haptic bindings being accepted while the
+  button bindings are not the ones the runtime used.
+- The menu click logic itself is plausible: with default settings the right hand drives the cursor and
+  `domButton1` (A) or the trigger produces `K_MOUSE1`; the engine path after `Sys_QueEvent` is stock Quake 3.
+
+### Defects found in source
+1. **`XR_BD_controller_interaction` was never enabled** (`TBXR_Common.c`: only the GLES and Android create-instance
+   extensions). The PICO 4 profile `/interaction_profiles/bytedance/pico4_controller` is defined by that extension, so
+   suggesting bindings for it without the extension is rejected by the runtime. The `XrResult` of every
+   `xrSuggestInteractionProfileBindings` call was discarded, so this failure was silent.
+2. **`khr/simple_controller` fallback was unusable.** Its only button (`select/click`) was bound to
+   `triggerTouchAction`, which no code reads. A runtime that falls back to that profile therefore produced no usable
+   button at all while still giving poses and haptics — exactly the reported symptom.
+
+### Hypothesis (NOT confirmed)
+Because defect 1 rejects the PICO 4 profile, the PICO runtime most likely bound a fallback profile (possibly
+`khr/simple_controller`), whose select click was unreachable (defect 2). This fits the symptoms but the bound profile
+was never logged. The pre-existing line `VR controllers found: <path>` (logcat tag `RTCW`, printed by
+`TBXR_CheckControllers`) may already be in the captured logcat and would confirm or refute this: grep for it.
+
+### What M2A changed (all additive; Quest paths unchanged)
+- `TBXR_Common.c`: query instance extensions and enable `XR_BD_controller_interaction` only if the runtime advertises
+  it (Quest does not). Required extensions are unchanged.
+- `OpenXrInput.c`:
+  - New `selectAction` bound to `khr/simple_controller` select/click (replaces the unread `triggerTouchAction` binding);
+    folded into the trigger by `VrInput_EffectiveTrigger`.
+  - Every `xrSuggestInteractionProfileBindings` result is now logged; if the full PICO 4 set is rejected it retries once
+    without the optional bindings (`squeeze/click`, `thumbstick/touch`).
+  - Button bitmask construction moved into the pure, unit-tested `VrInputLogic.h` (same bit values, same thresholds,
+    compile-time `_Static_assert` against `xrButton_*`); thumbstick and per-hand reading unified in `TBXR_ReadHand`.
+  - Logs the bound profile per hand, `xrSyncActions` / `xrAttachSessionActionSets` results and action errors.
+- `VrInputCommon.c` / `VrInputDefault.c`: `handleTrackedControllerButton` uses the shared edge function; the two
+  `K_MOUSE1` calls per hand are now `handleMenuClick` (same events, same order). Menu hand choice uses
+  `VrInput_MenuUsesOffhand` (same condition). Both log generated key events.
+- `cl_keys.c`: one-line hook at the top of `CL_KeyEvent` reporting delivery of MOUSE1/ESCAPE/SPACE.
+- New: `VrInputLogic.h`, `VrInputDiag.c/.h`, `rtcw/Android_client.mk` entry, `tests/vr_input`,
+  `.github/workflows/input-host-tests.yml`, `docs/INPUT_DIAGNOSTICS.md`, `docs/PICO4_INPUT_TEST_PLAN.md`.
+- Diagnostics: logcat tag `RTCWInput`, state changes only, rate limited, cvar `vr_input_diag` (default 1, 0 = off).
+  Format and events: `docs/INPUT_DIAGNOSTICS.md`.
+
+### What was actually tested
+- VERIFIED (host): `make -C tests/vr_input test` — 98 checks, 0 failures (button edges, thresholds, per-hand masks,
+  select-as-trigger, menu hand selection, MOUSE1 press/release generation, diagnostics change-detection, rate limiting,
+  line format). Mutation check: deliberately breaking the select fold, the threshold and the menu-hand condition
+  each made the tests fail.
+- VERIFIED (static): the edited C files were syntax-checked with host clang against stub Android/GL headers; no errors
+  in the edited code. This is NOT the NDK build.
+- Android build of this branch: see the pull request (CI run link). Build success is not evidence of PICO 4 behaviour.
+- **NOT tested:** anything on a PICO 4 or Quest. The controller problem is **not** known to be fixed.
+
+### Next hardware verification
+Follow `docs/PICO4_INPUT_TEST_PLAN.md`: build via the existing workflow, install, run the 3-minute procedure while
+capturing `adb logcat -s RTCWInput:I RTCW:I`, fill in the evidence table, and send the log back. If clicks still fail,
+the first missing event in the trace identifies the broken link (`docs/INPUT_DIAGNOSTICS.md`).
+
+### Open questions
+- Which profile did the runtime actually bind in the first test (`VR controllers found:` line)?
+- Do right-hand clicks via A/B/trigger and left Menu (Escape) all work once the PICO 4 profile is accepted?
+- `TBXR_CheckControllers` maps unknown profiles (including `khr/simple_controller`) to Touch semantics; harmless for
+  buttons now, left unchanged.
