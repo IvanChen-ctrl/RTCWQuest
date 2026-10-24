@@ -379,6 +379,20 @@ void VrInputDiag_KeyGenerated(int hand, int key, int down)
                       HandChar(hand), KeyLabel(key), key, down);
 }
 
+void VrInputDiag_Jump(int route, int down)
+{
+    const char *name = "none";
+
+    if (route == 1) {
+        name = "moveup";
+    } else if (route == 2) {
+        name = "key_space";
+    } else if (route == 3) {
+        name = "activate";
+    }
+    VrInputDiag_Event("jump", "route=%s down=%d", name, down);
+}
+
 void VrInputDiag_KeyDelivered(int key, int down, int keyCatchers)
 {
     const char *route;
