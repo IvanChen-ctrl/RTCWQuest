@@ -1,7 +1,8 @@
 name: Input Host Tests
 
 # Fast host-side tests for the controller input logic and diagnostics
-# (tests/vr_input).  No Android SDK/NDK needed; runs in a few seconds.
+# (tests/vr_input) and the M2B cinematic / pointer / transition logic
+# (tests/vr_m2b, which also runs tests/vr_input).  No Android SDK/NDK needed; runs in a few seconds.
 # This does NOT replace the Android Debug APK build and proves nothing about
 # runtime behaviour on a headset.
 on:
@@ -9,6 +10,12 @@ on:
   pull_request:
     paths:
       - 'tests/vr_input/**'
+      - 'tests/vr_m2b/**'
+      - 'Projects/Android/jni/RTCWVR/VrCinematicLogic.h'
+      - 'Projects/Android/jni/RTCWVR/VrPointerLogic.h'
+      - 'Projects/Android/jni/RTCWVR/VrTransitionLogic.h'
+      - 'Projects/Android/jni/RTCWVR/VrM2bDiag.c'
+      - 'Projects/Android/jni/RTCWVR/VrM2bDiag.h'
       - 'Projects/Android/jni/RTCWVR/VrInputLogic.h'
       - 'Projects/Android/jni/RTCWVR/VrInputDiag.c'
       - 'Projects/Android/jni/RTCWVR/VrInputDiag.h'
@@ -26,4 +33,4 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build and run host tests
-        run: make -C tests/vr_input test
+        run: make -C tests/vr_m2b test

@@ -62,6 +62,15 @@ The menu click path is: runtime profile -> bindings accepted -> action active ->
 8. `stage=gen` present but no `stage=deliver`: events are lost between `Sys_QueEvent` and `CL_KeyEvent`.
 9. `stage=deliver route=ui` present but nothing activates: the problem is inside the UI (cursor focus), not input.
 
+## Related (M2B)
+
+Cinematic (`RTCWCinematic`) and pointer (`RTCWPointer`) diagnostics use the same line format and are documented in
+`docs/M2B_CINEMATIC_POINTER_DIAGNOSTICS.md`. M2B adds one `RTCWInput` event:
+
+| `ev` | Fields | Emitted when |
+|---|---|---|
+| `release` | `reason` (`to_screen`/`to_game`), `actions`, `keys` | The screen-layer mode changed while the VR layer still held `+actions`/keys it started; they were released. |
+
 ## Notes
 
 - The pre-existing engine line `VR controllers found: <profile path>` (tag `RTCW`) is printed once when the right
