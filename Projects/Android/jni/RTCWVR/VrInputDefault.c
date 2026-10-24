@@ -118,19 +118,25 @@ void HandleInput_Default( ovrInputStateGamepad *pFootTrackingNew, ovrInputStateG
         vr.weapon_recoil *= 0.8f; // quick reduction on synthetic recoil
     }
 
+    // Mode switch (gameplay <-> menu/loading): release what this layer still holds down
+    VrInput_ModeTransition(RTCWVR_useScreenLayer());
+
     //Menu button
 	handleTrackedControllerButton(&leftTrackedRemoteState_new, &leftTrackedRemoteState_old, ovrButton_Enter, K_ESCAPE);
 	if (vr.toggleMainMenu) { // Menu toggled via wheel selector
 		vr.toggleMainMenu = qfalse;
-		Sys_QueEvent( 0, SE_KEY, K_ESCAPE, qtrue, 0, NULL );
+		VrInput_QueueKey( K_ESCAPE, qtrue );
 	}
 
-    static float menuYaw = 0;
+    // The cursor is relative to the yaw the menu quad was placed at (see TBXR_submitFrame),
+    // not to a separately maintained value.
+    float menuYaw = vr.hmdorientation_snap[YAW];
     if ( RTCWVR_useScreenLayer() )
     {
         bool controlsLeftHanded = vr_control_scheme->integer >= 10;
         VrInputDiag_MenuHand(VrInput_MenuCursorHand(controlsLeftHanded, vr.menu_right_handed, vr.right_handed),
                              vr.menu_right_handed, controlsLeftHanded, 1);
+        VrPtrDiag_MenuHand(VrInput_MenuCursorHand(controlsLeftHanded, vr.menu_right_handed, vr.right_handed));
         if (VrInput_MenuUsesOffhand(controlsLeftHanded, vr.menu_right_handed)) {
             interactWithTouchScreen(menuYaw, vr.offhandangles);
             handleMenuClick(pOffTrackedRemoteNew, pOffTrackedRemoteOld, offButton1, K_MOUSE1);
@@ -155,8 +161,6 @@ void HandleInput_Default( ovrInputStateGamepad *pFootTrackingNew, ovrInputStateG
     }
     else
     {
-        menuYaw = vr.hmdorientation[YAW];
-
         float distance = sqrtf(powf(pOff->HeadPose.Pose.Position.x - pWeapon->HeadPose.Pose.Position.x, 2) +
                                powf(pOff->HeadPose.Pose.Position.y - pWeapon->HeadPose.Pose.Position.y, 2) +
                                powf(pOff->HeadPose.Pose.Position.z - pWeapon->HeadPose.Pose.Position.z, 2));
@@ -555,7 +559,7 @@ void HandleInput_Default( ovrInputStateGamepad *pFootTrackingNew, ovrInputStateG
                     if (vr.mountedgun) {
                         sendButtonAction("+activate", (primaryButtonsNew & primaryButton2) != 0);
                     } else {
-                        Sys_QueEvent( 0, SE_KEY, K_SPACE, (primaryButtonsNew & primaryButton2) != 0, 0, NULL );
+                        VrInput_QueueKey( K_SPACE, (primaryButtonsNew & primaryButton2) != 0 );
                     }
                 }
             }

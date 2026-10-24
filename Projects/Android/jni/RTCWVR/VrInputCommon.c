@@ -10,6 +10,11 @@ Authors		:	Simon Brown
 #include "VrInput.h"
 #include "VrInputLogic.h"
 #include "VrInputDiag.h"
+#include "VrPointerLogic.h"
+#include "VrTransitionLogic.h"
+#include "VrM2bDiag.h"
+
+#include <string.h>
 
 #include <src/qcommon/qcommon.h>
 
@@ -23,12 +28,63 @@ static int handIndexOf(const ovrInputStateTrackedRemote * trackedRemoteState)
     return -1;
 }
 
+// Keys and "+action" commands this layer currently holds down (see VrTransitionLogic.h).
+static vrHeld_t vrHeld;
+static vrModeTracker_t vrModeTracker;
+
+// Queues an engine key event and remembers whether the key is held, so a mode switch
+// between the press and the release cannot leave it stuck.
+void VrInput_QueueKey(int key, int down)
+{
+    VrHeld_Key(&vrHeld, key, down);
+    Sys_QueEvent( 0, SE_KEY, key, down, 0, NULL );
+}
+
+// Releases only what this layer started and has not released yet.
+void VrInput_ReleaseHeld(const char *reason)
+{
+    char name[VRT_ACTION_NAME_MAX + 2];
+    int key;
+    int actions = vrHeld.actionCount;
+    int keys = vrHeld.keyCount;
+
+    if (actions == 0 && keys == 0)
+    {
+        return;
+    }
+    while (VrHeld_TakeAction(&vrHeld, name + 1))
+    {
+        name[0] = '-';
+        size_t len = strlen(name);
+        name[len] = '\n';
+        name[len + 1] = '\0';
+        Cbuf_AddText( name );
+    }
+    while (VrHeld_TakeKey(&vrHeld, &key))
+    {
+        Sys_QueEvent( 0, SE_KEY, key, 0, 0, NULL );
+        VrInputDiag_KeyGenerated( -1, key, 0 );
+    }
+    VrInputDiag_Event("release", "reason=%s actions=%d keys=%d", reason, actions, keys);
+}
+
+// Call once per input frame with the current screen-layer state.  When the mode
+// changed since the previous frame (gameplay <-> menu/loading), anything still held
+// is released, because the matching button edge would be handled by the other mode.
+void VrInput_ModeTransition(int screen)
+{
+    if (VrMode_Changed(&vrModeTracker, screen))
+    {
+        VrInput_ReleaseHeld(screen ? "to_screen" : "to_game");
+    }
+}
+
 void handleTrackedControllerButton(ovrInputStateTrackedRemote * trackedRemoteState, ovrInputStateTrackedRemote * prevTrackedRemoteState, uint32_t button, int key)
 {
     int edge = VrInput_ButtonEdge(trackedRemoteState->Buttons, prevTrackedRemoteState->Buttons, button);
     if (edge >= 0)
     {
-        Sys_QueEvent( 0, SE_KEY, key, edge, 0, NULL );
+        VrInput_QueueKey( key, edge );
         VrInputDiag_KeyGenerated( handIndexOf(trackedRemoteState), key, edge );
 //        Key_Event(key, (trackedRemoteState->Buttons & button) != 0, global_time);
     }
@@ -43,7 +99,7 @@ void handleMenuClick(ovrInputStateTrackedRemote * trackedRemoteState, ovrInputSt
                                         confirmButton, ovrButton_Trigger, mouseKey, events);
     for (int i = 0; i < count; i++)
     {
-        Sys_QueEvent( 0, SE_KEY, events[i].key, events[i].down, 0, NULL );
+        VrInput_QueueKey( events[i].key, events[i].down );
         VrInputDiag_KeyGenerated( handIndexOf(trackedRemoteState), events[i].key, events[i].down );
     }
 }
@@ -99,6 +155,7 @@ void sendButtonAction(const char* action, long buttonDown)
 {
     char command[256];
     snprintf( command, sizeof( command ), "%s\n", action );
+    VrHeld_Action(&vrHeld, action, buttonDown != 0);
     if (!buttonDown)
     {
         command[0] = '-';
@@ -144,9 +201,18 @@ inline float clamp(float _min, float _val, float _max)
     return max(min(_val, _max), _min);
 }
 
+// menuYaw must be the yaw the menu quad is placed at (vr.hmdorientation_snap[YAW]): the
+// cursor is the controller direction relative to the panel, so both have to use the
+// same reference.  Non-finite input leaves the cursor where it is.
 void interactWithTouchScreen(float menuYaw, vec3_t controllerAngles) {
-    float cursorX = -sinf(DEG2RAD(controllerAngles[YAW] - menuYaw)) + 0.5f;
-    float cursorY = (float)((controllerAngles[PITCH] - 15) / 90.0) + 0.5f;
+    float cursorX;
+    float cursorY;
 
+    if (!VrPointer_FromAngles(controllerAngles[YAW], controllerAngles[PITCH], menuYaw, &cursorX, &cursorY)) {
+        VrPtrDiag_Rejected(controllerAngles[YAW], controllerAngles[PITCH], menuYaw);
+        return;
+    }
+    VrPtrDiag_Sample(controllerAngles[YAW], controllerAngles[PITCH], menuYaw, vr.hmdorientation[YAW],
+                     cursorX, cursorY);
     PortableMouseAbs(cursorX, cursorY);
 }

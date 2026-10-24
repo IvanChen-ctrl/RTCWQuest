@@ -14,6 +14,7 @@
 #include <pthread.h>
 
 #include "src/client/client.h"
+#include "../../../RTCWVR/VrPointerLogic.h"
 
 
 #include <android/log.h>
@@ -228,8 +229,7 @@ int absx=0,absy=0;
 RTCWVR_GetScreenRes(int *width, int *height);
 void PortableMouseAbs(float x,float y)
 {
-	absx = x * 640;
-	absy = y * 480;
+	VrPointer_ToUi(x, y, &absx, &absy);     // normalized -> 640x480 (RTCWVR/VrPointerLogic.h)
 }
 
 

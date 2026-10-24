@@ -27,6 +27,8 @@ Engine-side only; no DLL / vr_client_info_t contract change.
 #include "VrCvars.h"
 #include "VrInputLogic.h"
 #include "VrInputDiag.h"
+#include "VrPointerLogic.h"
+#include "VrM2bDiag.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -679,6 +681,9 @@ static void TBXR_ReadHand(int hand, ovrInputStateTrackedRemote* out)
     }
 }
 
+// Last usable aim orientation per hand (M2B, see VrPointerLogic.h)
+static vrPoseHold_t controllerPoseHold[2];
+
 void TBXR_UpdateControllers( )
 {
     if (gAppState.Session == XR_NULL_HANDLE || gAppState.FrameState.predictedDisplayTime == 0) {
@@ -700,6 +705,18 @@ void TBXR_UpdateControllers( )
         xrLocateSpace(aimSpace[i], gAppState.StageSpace, gAppState.FrameState.predictedDisplayTime, &loc);
 
         gAppState.TrackedController[i].Active = (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
+        {
+            // M2B: an unfilled location holds an all-zero quaternion.  Keep the last usable
+            // orientation instead of turning it into a garbage pointer direction.
+            vrQuat_t qIn = { loc.pose.orientation.x, loc.pose.orientation.y, loc.pose.orientation.z, loc.pose.orientation.w };
+            vrQuat_t qOut;
+            int usable = VrPointer_HoldPose(&controllerPoseHold[i], &qIn, &qOut);
+            VrPtrDiag_Pose(i == 0 ? "L" : "R", usable, (unsigned)loc.locationFlags);
+            loc.pose.orientation.x = qOut.x;
+            loc.pose.orientation.y = qOut.y;
+            loc.pose.orientation.z = qOut.z;
+            loc.pose.orientation.w = qOut.w;
+        }
         gAppState.TrackedController[i].HeadPose.Pose.Orientation = loc.pose.orientation;
         gAppState.TrackedController[i].HeadPose.Pose.Position = loc.pose.position;
         gAppState.TrackedController[i].HeadPose.LinearVelocity =

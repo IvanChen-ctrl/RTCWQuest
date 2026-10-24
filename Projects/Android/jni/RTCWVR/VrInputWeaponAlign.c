@@ -53,10 +53,14 @@ void HandleInput_WeaponAlign( ovrInputStateTrackedRemote *pDominantTrackedRemote
 
     }
 
+    // Mode switch (gameplay <-> menu/loading): release what this layer still holds down
+    VrInput_ModeTransition(RTCWVR_useScreenLayer());
+
     //Menu button
 	handleTrackedControllerButton(&leftTrackedRemoteState_new, &leftTrackedRemoteState_old, ovrButton_Enter, K_ESCAPE);
 
-    static float menuYaw = 0;
+    // Same reference yaw as the menu quad (see TBXR_submitFrame)
+    float menuYaw = vr.hmdorientation_snap[YAW];
     static bool switchedMenuControls = qfalse;
     if ( RTCWVR_useScreenLayer() )
     {
@@ -81,8 +85,6 @@ void HandleInput_WeaponAlign( ovrInputStateTrackedRemote *pDominantTrackedRemote
     }
     else
     {
-        menuYaw = vr.hmdorientation[YAW];
-
         //dominant hand stuff first
         {
 			///Weapon location relative to view
