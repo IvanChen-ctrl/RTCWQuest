@@ -359,6 +359,12 @@ void IN_CenterView( void ) {
 }
 
 void IN_Notebook( void ) {
+	// M2B: this menu pauses the game; never open it during a camera sequence (stock RTCW cannot,
+	// CL_KeyEvent eats all keys then, but the VR layer issues this command directly)
+	if ( !VrCin_PauseMenuAllowed( cl.cameraMode ) ) {
+		VrCinDiag_PauseMenuRefused( "notebook" );
+		return;
+	}
 	if ( cls.state == CA_ACTIVE && !clc.demoplaying ) {
 		Cvar_Set( "cg_youGotMail", "0" ); // clear icon	//----(SA)	added
 		VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_NOTEBOOK );    // startup notebook
@@ -366,6 +372,10 @@ void IN_Notebook( void ) {
 }
 
 void IN_Help( void ) {
+	if ( !VrCin_PauseMenuAllowed( cl.cameraMode ) ) {   // M2B: see IN_Notebook
+		VrCinDiag_PauseMenuRefused( "help" );
+		return;
+	}
 	if ( cls.state == CA_ACTIVE && !clc.demoplaying ) {
 		VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_HELP );        // startup help system
 	}

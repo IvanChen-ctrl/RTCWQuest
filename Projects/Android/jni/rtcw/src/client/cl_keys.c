@@ -1639,6 +1639,14 @@ Called by the system for both key up and key down events
 */
 //static int consoleCount = 0; // TTimo: unused
 void VrInputDiag_KeyDelivered( int key, int down, int keyCatchers ); // VR input diagnostics (RTCWVR/VrInputDiag.c)
+
+// M2B: at most one unacknowledged "cameraInterrupt" in flight (see CL_KeyEvent)
+static vrCinGate_t cameraInterruptGate;
+
+void CL_ResetCameraInterruptGate( void ) {
+	VrCin_GateReset( &cameraInterruptGate );
+}
+
 void CL_KeyEvent( int key, qboolean down, unsigned time ) {
 	char    *kb;
 	char cmd[1024];
@@ -1693,28 +1701,26 @@ void CL_KeyEvent( int key, qboolean down, unsigned time ) {
 	}
 
 //----(SA)	added
+	// M2B: the decision is made by VrCin_CameraKey (RTCWVR/VrCinematicLogic.h).  It matches the
+	// original block except that a skip key is ignored while the previous cameraInterrupt is
+	// still unacknowledged, so one skip request is queued no matter how often the key repeats.
 	if ( cl.cameraMode ) {
-		if ( !( cls.keyCatchers & ( KEYCATCH_UI | KEYCATCH_CONSOLE ) ) ) {    // let menu/console handle keys if necessary
-
+		switch ( VrCin_CameraKey( cl.cameraMode, cls.keyCatchers, key, down,
+								  &cameraInterruptGate, clc.reliableSequence, clc.reliableAcknowledge ) ) {
+		case VRCIN_KEY_INTERRUPT:
 			// in cutscenes we need to handle keys specially (pausing not allowed in camera mode)
-			if ( (  key == K_ESCAPE ||
-					key == K_SPACE ||
-					key == K_ENTER ) && down ) {
-				if ( down ) {
-					CL_AddReliableCommand( "cameraInterrupt" );
-				}
-				return;
-			}
-
-			// eat all keys
-			if ( down ) {
-				return;
-			}
-		}
-
-		if ( ( cls.keyCatchers & KEYCATCH_CONSOLE ) && key == K_ESCAPE ) {
-			// don't allow menu starting when console is down and camera running
+			CL_AddReliableCommand( "cameraInterrupt" );
+			VrCin_InterruptQueued( &cameraInterruptGate, clc.reliableSequence );
+			VrCinDiag_Interrupt( key, 1 );
 			return;
+		case VRCIN_KEY_INTERRUPT_SUPPRESSED:
+			VrCinDiag_Interrupt( key, 0 );
+			return;
+		case VRCIN_KEY_EAT:                 // eat all keys
+		case VRCIN_KEY_CONSOLE_ESC:         // don't allow menu starting when console is down and camera running
+			return;
+		default:
+			break;
 		}
 	}
 //----(SA)	end

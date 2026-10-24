@@ -22,6 +22,8 @@ EFXR_SurfaceView.c; the JNI VM/activity the loader needs come from gAppThread
 #include "TBXR_Common.h"
 #include "VrCvars.h"
 #include "VrInputDiag.h"
+#include "VrPointerLogic.h"
+#include "VrM2bDiag.h"
 
 #include <time.h>
 #include <stdlib.h>
@@ -1316,6 +1318,10 @@ void TBXR_InitialiseOpenXR()
 
 void TBXR_Recenter() {
 
+	// M2B: the menu placement (snap) and the cursor reference refer to the old space
+	VrPtrDiag_Recenter(vr.hmdorientation[YAW]);
+	VR_RequestScreenSnap();
+
 	// Calculate recenter reference
 	XrReferenceSpaceCreateInfo spaceCreateInfo = {0};
 	spaceCreateInfo.type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO;
@@ -1372,8 +1378,22 @@ static void TBXR_GetHMDOrientation() {
 	vec3_t rotation = {0, 0, 0};
 	vec3_t hmdorientation = {0, 0, 0};
 	QuatToYawPitchRoll(quatHmd, rotation, hmdorientation);
-	VR_SetHMDPosition(positionHmd.x, positionHmd.y, positionHmd.z);
+
+	// M2B: a pose that is not a usable orientation (all-zero quaternion from an unfilled
+	// location, or flagged invalid) must not become the menu placement.  Normal operation
+	// is unchanged: the pose is still applied every frame.
+	static int flagsMissingStreak = 0;
+	int quatOk = VrPointer_QuatUsable(quatHmd.x, quatHmd.y, quatHmd.z, quatHmd.w);
+	int flagsOk = XR_UNQUALIFIED_SUCCESS(locateResult) &&
+				  (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0;
+	int hmdUsable = VrPointer_PoseUsable(quatOk, flagsOk, &flagsMissingStreak);
+	VrPtrDiag_Pose("HMD", hmdUsable, (unsigned)loc.locationFlags);
+	VR_SetHMDPoseUsable(hmdUsable);
+
+	// Orientation first so a menu snap taken in VR_SetHMDPosition uses this frame's yaw
+	// (matters right after a recenter, when the yaw jumps).
 	VR_SetHMDOrientation(hmdorientation[0], hmdorientation[1], hmdorientation[2]);
+	VR_SetHMDPosition(positionHmd.x, positionHmd.y, positionHmd.z);
 }
 
 

@@ -149,6 +149,9 @@ void rotateAboutOrigin(float v1, float v2, float rotation, vec2_t out);
 void QuatToYawPitchRoll(ovrQuatf q, vec3_t rotation, vec3_t out);
 void handleTrackedControllerButton(ovrInputStateTrackedRemote * trackedRemoteState, ovrInputStateTrackedRemote * prevTrackedRemoteState, uint32_t button, int key);
 void interactWithTouchScreen(float menuYaw, vec3_t controllerAngles);
+void VrInput_QueueKey(int key, int down);
+void VrInput_ReleaseHeld(const char *reason);
+void VrInput_ModeTransition(int screen);
 int GetRefresh();
 int GetRequestedRefresh();
 

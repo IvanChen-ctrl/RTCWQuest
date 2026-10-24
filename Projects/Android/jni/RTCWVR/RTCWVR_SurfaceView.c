@@ -10,6 +10,8 @@
 #include "TBXR_Common.h"
 #include "VrCvars.h"
 #include "VrInput.h"
+#include "VrPointerLogic.h"
+#include "VrM2bDiag.h"
 
 #include "../rtcw/src/client/client.h"
 #include "../rtcw/src/qcommon/qcommon.h"
@@ -351,18 +353,37 @@ void VR_SetHMDOrientation(float pitch, float yaw, float roll)
 	vr.clientview_yaw_last = clientview_yaw;
 }
 
+// Menu placement ("snap"): when and from which HMD pose the screen layer is positioned.
+// The decision lives in VrPointerLogic.h so it can be tested on a host.
+static vrSnapState_t hmdSnapState;
+static int hmdPoseUsable = 1;
+
+void VR_SetHMDPoseUsable(int usable)
+{
+	hmdPoseUsable = usable;
+}
+
+// The reference spaces were recreated (recenter): the old snap is in a stale frame.
+void VR_RequestScreenSnap(void)
+{
+	VrSnap_RequestRecenter(&hmdSnapState);
+}
+
 void VR_SetHMDPosition(float x, float y, float z)
 {
-	static qboolean s_useScreen = qfalse;
-	static int frame = 0;
+	static const char *snapNames[] = { "none", "warmup", "pose_valid", "screen_toggle", "recenter" };
 
 	VectorSet(vr.hmdposition, x, y, z);
 
 	qboolean useScreen = VR_UseScreenLayer();
-	if ((s_useScreen != useScreen) || (frame++ < 100)) {
-		s_useScreen = useScreen;
+	int snapReason = VrSnap_Update(&hmdSnapState, useScreen, hmdPoseUsable);
+	if (snapReason != VRSNAP_NONE) {
 		VectorSet(vr.hmdposition_snap, x, y, z);
 		VectorCopy(vr.hmdorientation, vr.hmdorientation_snap);
+		if (snapReason != VRSNAP_WARMUP) {
+			VrPtrDiag_Snap(snapNames[snapReason], vr.hmdorientation[YAW], vr.hmdorientation_snap[YAW],
+						   x, y, z, useScreen);
+		}
 	}
 
 	VectorSubtract(vr.hmdposition, vr.hmdposition_snap, vr.hmdposition_offset);

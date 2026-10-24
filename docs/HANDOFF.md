@@ -1,10 +1,13 @@
 # HANDOFF
 
-## Status (updated in M2A — read "Milestone 2A" at the bottom first)
-M0 (audit/docs) and M1A (CI workflow) are merged to `master` (PR #1, PR #2). The Actions build has succeeded twice.
-First real PICO 4 run: app starts, renders the menu, right controller moves the cursor with hover haptics, but no
-controller button activates anything. M2A (branch `claude/elegant-bardeen-ykx27m`) investigates and addresses that;
-it is NOT verified on hardware yet. The M0 and M1A sections below are kept as history and are partly stale.
+## Status (updated in M2B — read "Milestone 2B" at the bottom first)
+M0 (audit/docs), M1A (CI workflow) and M2A (controller input, PR #3) are merged to `master` (latest `ceca712`).
+Physical PICO 4 test of the M2A build (owner, 2026-10-24/25): the app runs, the menu renders, the right controller moves
+the cursor with hover haptics, **trigger clicks now work**, menu items can be selected, the opening cinematic plays and
+**finishes naturally into the first-person scene**. Open problems: skipping the cinematic can end in
+`Error: Client command overflow`, and the menu pointer is intermittently misaligned. M2B (branch
+`pico4-m2b-cinematic-menu`) addresses both; it is NOT verified on hardware. The M0 and M1A sections below are history
+and partly stale.
 
 ## Start point
 - Upstream state: `master` @ `4c714b9163b0de94a856ac896c6cfa56a283de74` ("Fix Tesla and a Quest Permission Issue")
@@ -147,3 +150,68 @@ the first missing event in the trace identifies the broken link (`docs/INPUT_DIA
 - Do right-hand clicks via A/B/trigger and left Menu (Escape) all work once the PICO 4 profile is accepted?
 - `TBXR_CheckControllers` maps unknown profiles (including `khr/simple_controller`) to Touch semantics; harmless for
   buttons now, left unchanged.
+
+---
+
+## Milestone 2B — cinematic skip overflow, menu pointer, input transitions
+
+Full write-up: `docs/M2B_CINEMATIC_POINTER_DIAGNOSTICS.md` (read it; this section is a summary).
+
+### Confirmed on hardware before M2B (owner, PICO 4 A8110, Android 10, firmware 5.13.7, RTCWQuest 1.5.0 / 53)
+- M2A is merged (PR #3). Menu pointing, hover haptics, controller clicking, menu selection work.
+- The opening cinematic runs; letting it finish enters the first-person scene (recordings 05.55.27 and 05.58.48).
+- **Reproduced:** `Error: Client command overflow` at about 16 s in recording 06.06.44 after trying to skip. The log
+  capture supplied (Feedback Bridge v0.3, 21:54 UTC) predates the error, so the internal state at the failure is unknown.
+- **Intermittent:** the menu pointer sometimes does not line up with the menu; restarting restores it.
+
+### Findings (source-level; details and evidence in the M2B document)
+- The error string exists only in `CL_AddReliableCommand` (`cl_main.c`): more than 256 unacknowledged reliable commands.
+- During a camera sequence cgame queues one `setCameraOrigin` per frame. If the game is paused (`cl_paused && sv_paused`)
+  nothing is sent or acknowledged, so the queue overflows after about 256 frames (~3 s).
+- The VR layer is in its gameplay branch during cutscenes and its left-Y `notebook` command reaches `IN_Notebook`, which
+  pauses the game with no camera check (stock RTCW cannot, because `CL_KeyEvent` eats keys in camera mode).
+  **This mechanism is source-proven; that it is what happened in the recording is ASSUMED.**
+- Pointer: the cursor was computed against a static `menuYaw` (0 until the first non-menu frame) while the panel is placed
+  at `vr.hmdorientation_snap[YAW]`. Pointing at the panel centre therefore gives a wrong cursor whenever the launch yaw is
+  not about 0. Source-proven defect; hardware effect ASSUMED.
+- Also seen: pulling the *other* controller's trigger in the menu intentionally switches the cursor hand (not a bug,
+  restart resets it); HMD pose could be frozen in as the menu direction while invalid; recenter never re-placed the menu;
+  a gameplay action pressed before a mode switch could stay held.
+
+### What M2B changed (small, reversible; Quest paths unchanged)
+- `cl_input.c`: `IN_Notebook`/`IN_Help` refuse while `cl.cameraMode`.
+- `cl_main.c` / `cl_cgame.c`: cgame's `trap_SendClientCommand` goes through `CL_AddCgameReliableCommand`, which does not
+  queue the superseded per-frame `setCameraOrigin` while paused or when 64+ commands are unacknowledged. Other commands and
+  the overflow error are unchanged. `MAX_RELIABLE_COMMANDS` unchanged.
+- `cl_keys.c`: `cameraInterrupt` (skip) is queued once until acknowledged (`VrCin_CameraKey`).
+- Pointer: both input handlers use `vr.hmdorientation_snap[YAW]` as the reference; snap decision moved to
+  `VrPointerLogic.h` (no snap from an unusable pose, re-snap on recenter and when the pose returns); controller/HMD
+  non-unit quaternions are held/ignored; non-finite angles never reach the cursor. Mapping formula unchanged.
+- Input transitions: the VR layer remembers the `+actions` and keys it holds and releases only those when the screen
+  layer mode changes (`VrTransitionLogic.h`, `VrInput_ModeTransition`).
+- New files: `VrCinematicLogic.h`, `VrPointerLogic.h`, `VrTransitionLogic.h`, `VrM2bDiag.c/.h`, `tests/vr_m2b/`,
+  `docs/M2B_CINEMATIC_POINTER_DIAGNOSTICS.md`; `Android_client.mk` lists `VrM2bDiag.c`; `input-host-tests.yml` runs
+  the new host tests.
+- Diagnostics: logcat tags `RTCWCinematic` (cvar `vr_cin_diag`) and `RTCWPointer` (cvar `vr_pointer_diag`), same line
+  format as `RTCWInput`; `ev=overflow` is always logged with the backlog by command **name**.
+
+### Tests performed
+- VERIFIED (host): `make -C tests/vr_m2b test` — 1449 checks, 0 failures; it also runs `tests/vr_input` (98 checks, 0
+  failures). Mutation checks (disabling each guard/snap rule) fail the tests. The old behaviour (overflow ~257 frames after
+  a pause during a camera) is reproduced by the model and absent with the guard.
+- VERIFIED (static): the edited engine and VR files pass `gcc -fsyntax-only` with stub Android/EGL/JNI headers (not the
+  NDK build).
+- Android APK build of this branch: see the pull request (workflow run link and result). Build success is not evidence of
+  PICO 4 behaviour.
+- **NOT tested:** anything on a PICO 4 or Quest. Neither defect is known to be fixed.
+
+### Remaining hardware verification
+Follow section 6 of the M2B document (5 cold starts, hand switch, natural completion, skip by Menu and B, hold B, Y during
+the cutscene, rapid presses, fire-then-menu, gameplay regression, recenter) with the capture
+`adb logcat -s RTCWCinematic:I RTCWPointer:I RTCWInput:I RTCW:I` and record date, build/commit and APK SHA-256 in `docs/`.
+
+### Open questions
+- Which button was pressed when the overflow occurred? (`ev=overflow kinds= paused=` and `ev=interrupt`/`pause_refused`.)
+- Does the PICO runtime send `XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING` on recenter (`ev=recenter`)?
+- Are `XR_SPACE_LOCATION_ORIENTATION_VALID_BIT` flags reliable on the PICO 4 (`ev=pose who=... flags=`)?
+- Is the remaining pointer error, if any, the angular mapping (not changed) rather than the reference or hand switch?

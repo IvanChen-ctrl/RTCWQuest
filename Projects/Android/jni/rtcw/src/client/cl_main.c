@@ -173,12 +173,71 @@ void CL_AddReliableCommand( const char *cmd ) {
 //	if(cl.cameraMode)
 //		Com_Printf ("cmd: %s\n", cmd);
 
-	if ( clc.reliableSequence - clc.reliableAcknowledge > MAX_RELIABLE_COMMANDS ) {
+	if ( VrCin_WouldOverflow( clc.reliableSequence, clc.reliableAcknowledge, MAX_RELIABLE_COMMANDS ) ) {
+		// M2B: report what filled the queue (command names only), then raise
+		// the unchanged error.
+		char kinds[VRCIN_KIND_SLOTS * ( VRCIN_KIND_NAME_MAX + 8 ) + 16];
+		CL_DescribeReliableBacklog( kinds, sizeof( kinds ) );
+		VrCinDiag_Overflow( kinds );
 		Com_Error( ERR_DROP, "Client command overflow" );
 	}
 	clc.reliableSequence++;
 	index = clc.reliableSequence & ( MAX_RELIABLE_COMMANDS - 1 );
 	Q_strncpyz( clc.reliableCommands[ index ], cmd, sizeof( clc.reliableCommands[ index ] ) );
+	VrCinDiag_QueueDepth( VrCin_Outstanding( clc.reliableSequence, clc.reliableAcknowledge ) );
+}
+
+/*
+======================
+CL_DescribeReliableBacklog
+
+Diagnostics only: "name:count,name:count,...,other:n" for the unacknowledged
+reliable commands.  Only the first token of each command is used, never the
+arguments.
+======================
+*/
+void CL_DescribeReliableBacklog( char *out, int outSize ) {
+	vrCinHistogram_t h;
+	int i;
+	int n = 0;
+
+	VrCin_HistogramInit( &h );
+	for ( i = clc.reliableAcknowledge + 1; i <= clc.reliableSequence && i - clc.reliableAcknowledge <= MAX_RELIABLE_COMMANDS; i++ ) {
+		VrCin_HistogramAdd( &h, clc.reliableCommands[ i & ( MAX_RELIABLE_COMMANDS - 1 ) ] );
+	}
+	out[0] = '\0';
+	for ( i = 0; i < VRCIN_KIND_SLOTS && h.count[i] > 0; i++ ) {
+		Com_sprintf( out + n, outSize - n, "%s%s:%d", n ? "," : "", h.kind[i], h.count[i] );
+		n = strlen( out );
+	}
+	if ( h.others > 0 ) {
+		Com_sprintf( out + n, outSize - n, "%sother:%d", n ? "," : "", h.others );
+	}
+	if ( !out[0] ) {
+		Q_strncpyz( out, "none", outSize );
+	}
+}
+
+/*
+======================
+CL_AddCgameReliableCommand
+
+Entry point for trap_SendClientCommand.  cgame re-sends "setCameraOrigin" every
+rendered frame during a camera sequence.  Each one only supersedes the last,
+but while the game is paused nothing is acknowledged, so they would pile up and
+overflow the queue.  Such "latest value wins" commands are not queued while
+paused or while a backlog is building; every other command is queued exactly
+as before, and a real overflow still raises the error.
+======================
+*/
+void CL_AddCgameReliableCommand( const char *cmd ) {
+	int paused = VrCin_ClientPaused( com_sv_running->integer, sv_paused->integer, cl_paused->integer );
+
+	if ( VrCin_ShouldSkipSupersedable( cmd, clc.reliableSequence, clc.reliableAcknowledge, paused ) ) {
+		VrCinDiag_Superseded( cmd, paused );
+		return;
+	}
+	CL_AddReliableCommand( cmd );
 }
 
 /*
@@ -2013,6 +2072,8 @@ void CL_Frame( int msec ) {
 	if ( !com_cl_running->integer ) {
 		return;
 	}
+
+	VrCinDiag_Frame();      // M2B: state-change diagnostics (RTCWCinematic)
 
 	if ( cls.cddialog ) {
 		// bring up the cd error dialog if needed

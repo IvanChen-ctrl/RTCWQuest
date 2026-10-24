@@ -287,6 +287,8 @@ qboolean VR_GetFovTangentsForEye(int eye, float *tanLeft, float *tanRight, float
 void VR_HandleControllerInput();
 void VR_SetHMDOrientation(float pitch, float yaw, float roll );
 void VR_SetHMDPosition(float x, float y, float z );
+void VR_SetHMDPoseUsable(int usable);
+void VR_RequestScreenSnap(void);
 void VR_HapticEvent(const char* event, int position, int flags, int intensity, float angle, float yHeight );
 void VR_HapticUpdateEvent(const char* event, int intensity, float angle );
 void VR_HapticEndFrame();

@@ -36,6 +36,8 @@ If you have questions concerning this license or the applicable additional terms
 #include "snd_public.h"
 #include "../cgame/cg_public.h"
 #include "../game/bg_public.h"
+#include "../../../RTCWVR/VrCinematicLogic.h"   // M2B: reliable command / cinematic skip logic
+#include "../../../RTCWVR/VrM2bDiag.h"          // M2B: RTCWCinematic diagnostics
 
 #define RETRANSMIT_TIMEOUT  3000    // time between connection packet retransmits
 
@@ -391,6 +393,9 @@ void CL_Init( void );
 void CL_FlushMemory( void );
 void CL_ShutdownAll( void );
 void CL_AddReliableCommand( const char *cmd );
+void CL_AddCgameReliableCommand( const char *cmd );                 // M2B
+void CL_DescribeReliableBacklog( char *out, int outSize );          // M2B
+void CL_ResetCameraInterruptGate( void );                           // M2B
 
 void CL_StartHunkUsers( void );
 
