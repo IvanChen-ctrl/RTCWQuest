@@ -1092,6 +1092,11 @@ extern vmCvar_t g_gameskill;
 
 extern vmCvar_t g_reloading;        //----(SA)	added
 
+// VR gameplay additions (g_vr.c)
+extern vmCvar_t vr_godmode;
+qboolean G_VrGodProtects( gentity_t *targ, int dflags );
+void     G_VrGodModeChanged( void );
+
 extern vmCvar_t g_dedicated;
 extern vmCvar_t g_cheats;
 extern vmCvar_t g_maxclients;               // allow this many total, including spectators

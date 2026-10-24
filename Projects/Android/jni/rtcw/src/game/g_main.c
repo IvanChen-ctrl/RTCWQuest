@@ -62,6 +62,7 @@ vmCvar_t g_gameskill;
 // done
 
 vmCvar_t g_reloading;       //----(SA)	added
+vmCvar_t vr_godmode;        // single-player God Mode (VR notebook / console), default off
 
 vmCvar_t g_dmflags;
 vmCvar_t g_fraglimit;
@@ -161,6 +162,7 @@ cvarTable_t gameCvarTable[] = {
 	// done
 
 	{ &g_reloading, "g_reloading", "0", CVAR_ROM },   //----(SA)	added
+	{ &vr_godmode, "vr_godmode", "0", 0, 0, qfalse },
 
 // JPW NERVE multiplayer stuffs
 	{ &g_redlimbotime, "g_redlimbotime", "30000", CVAR_SERVERINFO | CVAR_LATCH, 0, qfalse },
@@ -1048,6 +1050,10 @@ void G_UpdateCvars( void ) {
 				}
 
 				// check for changed values for particular cvars
+				if ( !Q_stricmp( cv->cvarName, "vr_godmode" ) ) {
+					G_VrGodModeChanged();
+				}
+
 				if ( !Q_stricmp( cv->cvarName, "g_playerStart" ) ) {
 					gentity_t *player;
 					player = AICast_FindEntityForName( "player" );

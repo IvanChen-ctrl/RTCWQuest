@@ -1128,6 +1128,11 @@ void G_Damage( gentity_t *targ, gentity_t *inflictor, gentity_t *attacker,
 			return;
 		}
 
+		// VR option "God Mode" (vr_godmode): same early-out as FL_GODMODE, single player only
+		if ( G_VrGodProtects( targ, dflags ) ) {
+			return;
+		}
+
 		// RF, warzombie defense position is basically godmode for the time being
 		if ( targ->flags & FL_DEFENSE_GUARD ) {
 			return;
