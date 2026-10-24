@@ -26,6 +26,8 @@ static inline float AngleBetweenVectors(const vec3_t a, const vec3_t b)
     return degrees(acosf(DotProduct(a, b)/(VectorLength(a) * VectorLength(b))));
 }
 
+void Sys_QueEvent( int time, sysEventType_t type, int value, int value2, int ptrLength, void *ptr );
+
 // Jump button state machine (see VrInputLogic.h).  Called every frame, in gameplay and
 // (with blocked set) in menus, so a held jump is always released and a press made
 // while blocked is never replayed later.
