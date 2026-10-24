@@ -33,6 +33,8 @@ extern float positional_movementSideways;
 extern float positional_movementForward;
 extern float snapTurn;
 
+void handleMenuClick(ovrInputStateTrackedRemote * trackedRemoteState, ovrInputStateTrackedRemote * prevTrackedRemoteState, uint32_t confirmButton, int mouseKey);
+
 void sendButtonAction(const char* action, long buttonDown);
 void sendButtonActionSimple(const char* action);
 

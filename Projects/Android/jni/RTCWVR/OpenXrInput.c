@@ -25,6 +25,25 @@ Engine-side only; no DLL / vr_client_info_t contract change.
 #include "VrCommon.h"
 #include "TBXR_Common.h"
 #include "VrCvars.h"
+#include "VrInputLogic.h"
+#include "VrInputDiag.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+/* The pure input logic in VrInputLogic.h must use the same bit values as the
+ * rest of the VR layer. */
+_Static_assert(VRI_BTN_A == xrButton_A, "button bit mismatch: A");
+_Static_assert(VRI_BTN_B == xrButton_B, "button bit mismatch: B");
+_Static_assert(VRI_BTN_X == xrButton_X, "button bit mismatch: X");
+_Static_assert(VRI_BTN_Y == xrButton_Y, "button bit mismatch: Y");
+_Static_assert(VRI_BTN_RTHUMB == xrButton_RThumb, "button bit mismatch: RThumb");
+_Static_assert(VRI_BTN_LTHUMB == xrButton_LThumb, "button bit mismatch: LThumb");
+_Static_assert(VRI_BTN_ENTER == xrButton_Enter, "button bit mismatch: Enter");
+_Static_assert(VRI_BTN_GRIP == xrButton_GripTrigger, "button bit mismatch: Grip");
+_Static_assert(VRI_BTN_TRIGGER == xrButton_Trigger, "button bit mismatch: Trigger");
+_Static_assert(VRI_BTN_JOYSTICK == xrButton_Joystick, "button bit mismatch: Joystick");
 
 extern ovrApp gAppState;
 
@@ -67,6 +86,7 @@ static XrAction BAction;   /* right B */
 static XrAction XAction;   /* left X  */
 static XrAction YAction;   /* left Y  */
 static XrAction backAction; /* menu/system button */
+static XrAction selectAction; /* khr/simple_controller select click (no analog trigger there) */
 
 static XrSpace aimSpace[SIDE_COUNT];
 static XrSpace handSpace[SIDE_COUNT];
@@ -80,7 +100,51 @@ static XrActionSuggestedBinding ActionSuggestedBinding(XrAction action, XrPath p
     return asb;
 }
 
-static XrActionStateBoolean GetActionStateBoolean(XrAction action, int hand) {
+static const char* XrResultName(XrResult r) {
+    switch (r) {
+        case XR_SUCCESS:                          return "XR_SUCCESS";
+        case XR_SESSION_NOT_FOCUSED:              return "XR_SESSION_NOT_FOCUSED";
+        case XR_SESSION_LOSS_PENDING:             return "XR_SESSION_LOSS_PENDING";
+        case XR_ERROR_VALIDATION_FAILURE:         return "XR_ERROR_VALIDATION_FAILURE";
+        case XR_ERROR_RUNTIME_FAILURE:            return "XR_ERROR_RUNTIME_FAILURE";
+        case XR_ERROR_HANDLE_INVALID:             return "XR_ERROR_HANDLE_INVALID";
+        case XR_ERROR_SESSION_LOST:               return "XR_ERROR_SESSION_LOST";
+        case XR_ERROR_PATH_INVALID:               return "XR_ERROR_PATH_INVALID";
+        case XR_ERROR_PATH_UNSUPPORTED:           return "XR_ERROR_PATH_UNSUPPORTED";
+        case XR_ERROR_ACTIONSETS_ALREADY_ATTACHED: return "XR_ERROR_ACTIONSETS_ALREADY_ATTACHED";
+        case XR_ERROR_ACTIONSET_NOT_ATTACHED:     return "XR_ERROR_ACTIONSET_NOT_ATTACHED";
+        case XR_ERROR_ACTION_TYPE_MISMATCH:       return "XR_ERROR_ACTION_TYPE_MISMATCH";
+        default:                                  return "XR_OTHER";
+    }
+}
+
+/* Suggest bindings for one interaction profile and log the outcome.  The result
+ * used to be discarded, which hid a rejected PICO 4 profile.  If the full set is
+ * rejected and coreCount < count, retry once with only the first coreCount
+ * bindings (callers put optional bindings last). */
+static void SuggestBindings(XrPath profile, const char* profileName,
+                            XrActionSuggestedBinding* bindings, int count, int coreCount) {
+    XrInteractionProfileSuggestedBinding sb = {0};
+    sb.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING;
+    sb.interactionProfile = profile;
+    sb.suggestedBindings = bindings;
+    sb.countSuggestedBindings = count;
+    sb.next = NULL;
+
+    char path[96];
+    snprintf(path, sizeof(path), "/interaction_profiles/%s", profileName);
+
+    XrResult res = xrSuggestInteractionProfileBindings(gAppState.Instance, &sb);
+    VrInputDiag_SuggestResult(path, (int)res, XrResultName(res), count, 0);
+
+    if (XR_FAILED(res) && coreCount > 0 && coreCount < count) {
+        sb.countSuggestedBindings = coreCount;
+        res = xrSuggestInteractionProfileBindings(gAppState.Instance, &sb);
+        VrInputDiag_SuggestResult(path, (int)res, XrResultName(res), coreCount, 1);
+    }
+}
+
+static XrActionStateBoolean GetActionStateBoolean(XrAction action, int hand, const char* name) {
     XrActionStateGetInfo getInfo = {0};
     getInfo.type = XR_TYPE_ACTION_STATE_GET_INFO;
     getInfo.action = action;
@@ -91,11 +155,13 @@ static XrActionStateBoolean GetActionStateBoolean(XrAction action, int hand) {
     XrActionStateBoolean state = {0};
     state.type = XR_TYPE_ACTION_STATE_BOOLEAN;
     state.next = NULL;
-    xrGetActionStateBoolean(gAppState.Session, &getInfo, &state);
+    XrResult res = xrGetActionStateBoolean(gAppState.Session, &getInfo, &state);
+    if (XR_FAILED(res))
+        VrInputDiag_ActionError(hand, name, (int)res, XrResultName(res));
     return state;
 }
 
-static XrActionStateFloat GetActionStateFloat(XrAction action, int hand) {
+static XrActionStateFloat GetActionStateFloat(XrAction action, int hand, const char* name) {
     XrActionStateGetInfo getInfo = {0};
     getInfo.type = XR_TYPE_ACTION_STATE_GET_INFO;
     getInfo.action = action;
@@ -106,11 +172,13 @@ static XrActionStateFloat GetActionStateFloat(XrAction action, int hand) {
     XrActionStateFloat state = {0};
     state.type = XR_TYPE_ACTION_STATE_FLOAT;
     state.next = NULL;
-    xrGetActionStateFloat(gAppState.Session, &getInfo, &state);
+    XrResult res = xrGetActionStateFloat(gAppState.Session, &getInfo, &state);
+    if (XR_FAILED(res))
+        VrInputDiag_ActionError(hand, name, (int)res, XrResultName(res));
     return state;
 }
 
-static XrActionStateVector2f GetActionStateVector2(XrAction action, int hand) {
+static XrActionStateVector2f GetActionStateVector2(XrAction action, int hand, const char* name) {
     XrActionStateGetInfo getInfo = {0};
     getInfo.type = XR_TYPE_ACTION_STATE_GET_INFO;
     getInfo.action = action;
@@ -121,7 +189,9 @@ static XrActionStateVector2f GetActionStateVector2(XrAction action, int hand) {
     XrActionStateVector2f state = {0};
     state.type = XR_TYPE_ACTION_STATE_VECTOR2F;
     state.next = NULL;
-    xrGetActionStateVector2f(gAppState.Session, &getInfo, &state);
+    XrResult res = xrGetActionStateVector2f(gAppState.Session, &getInfo, &state);
+    if (XR_FAILED(res))
+        VrInputDiag_ActionError(hand, name, (int)res, XrResultName(res));
     return state;
 }
 
@@ -198,6 +268,7 @@ void TBXR_InitActions( void )
     CreateAction(actionSet, XR_ACTION_TYPE_BOOLEAN_INPUT,    "xkey",            "X Key",          SIDE_COUNT, handSubactionPath, &XAction);
     CreateAction(actionSet, XR_ACTION_TYPE_BOOLEAN_INPUT,    "ykey",            "Y Key",          SIDE_COUNT, handSubactionPath, &YAction);
     CreateAction(actionSet, XR_ACTION_TYPE_BOOLEAN_INPUT,    "backkey",         "Menu Key",       SIDE_COUNT, handSubactionPath, &backAction);
+    CreateAction(actionSet, XR_ACTION_TYPE_BOOLEAN_INPUT,    "selectkey",       "Select Key",     SIDE_COUNT, handSubactionPath, &selectAction);
 
     // ---- Input source paths shared across profiles ----
     XrPath posePath[SIDE_COUNT];
@@ -257,8 +328,6 @@ void TBXR_InitActions( void )
     CHECK_XRCMD(xrStringToPath(gAppState.Instance, "/user/hand/left/input/x/click",  &XClickPath[SIDE_LEFT]));
     CHECK_XRCMD(xrStringToPath(gAppState.Instance, "/user/hand/left/input/y/click",  &YClickPath[SIDE_LEFT]));
 
-    XrResult result;
-
     // ---- Oculus Touch ----
     {
         XrPath profile;
@@ -290,13 +359,7 @@ void TBXR_InitActions( void )
         bindings[n++] = ActionSuggestedBinding(vibrateAction, hapticPath[SIDE_LEFT]);
         bindings[n++] = ActionSuggestedBinding(vibrateAction, hapticPath[SIDE_RIGHT]);
 
-        XrInteractionProfileSuggestedBinding sb = {0};
-        sb.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING;
-        sb.interactionProfile = profile;
-        sb.suggestedBindings = bindings;
-        sb.countSuggestedBindings = n;
-        sb.next = NULL;
-        result = xrSuggestInteractionProfileBindings(gAppState.Instance, &sb);
+        SuggestBindings(profile, "oculus/touch_controller", bindings, n, n);
     }
 
     // ---- Valve Index ----
@@ -330,13 +393,7 @@ void TBXR_InitActions( void )
         bindings[n++] = ActionSuggestedBinding(vibrateAction, hapticPath[SIDE_LEFT]);
         bindings[n++] = ActionSuggestedBinding(vibrateAction, hapticPath[SIDE_RIGHT]);
 
-        XrInteractionProfileSuggestedBinding sb = {0};
-        sb.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING;
-        sb.interactionProfile = profile;
-        sb.suggestedBindings = bindings;
-        sb.countSuggestedBindings = n;
-        sb.next = NULL;
-        result = xrSuggestInteractionProfileBindings(gAppState.Instance, &sb);
+        SuggestBindings(profile, "valve/index_controller", bindings, n, n);
     }
 
     // ---- HTC Vive wand (no thumbstick / face buttons; trigger + grip + menu) ----
@@ -359,13 +416,7 @@ void TBXR_InitActions( void )
         bindings[n++] = ActionSuggestedBinding(vibrateAction, hapticPath[SIDE_LEFT]);
         bindings[n++] = ActionSuggestedBinding(vibrateAction, hapticPath[SIDE_RIGHT]);
 
-        XrInteractionProfileSuggestedBinding sb = {0};
-        sb.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING;
-        sb.interactionProfile = profile;
-        sb.suggestedBindings = bindings;
-        sb.countSuggestedBindings = n;
-        sb.next = NULL;
-        result = xrSuggestInteractionProfileBindings(gAppState.Instance, &sb);
+        SuggestBindings(profile, "htc/vive_controller", bindings, n, n);
     }
 
     // ---- ByteDance Pico 4 ----
@@ -384,28 +435,25 @@ void TBXR_InitActions( void )
         bindings[n++] = ActionSuggestedBinding(triggerAction, triggerValuePath[SIDE_RIGHT]);
         bindings[n++] = ActionSuggestedBinding(squeezeAction, squeezeValuePath[SIDE_LEFT]);
         bindings[n++] = ActionSuggestedBinding(squeezeAction, squeezeValuePath[SIDE_RIGHT]);
-        bindings[n++] = ActionSuggestedBinding(squeezeClickAction, squeezeClickPath[SIDE_LEFT]);
-        bindings[n++] = ActionSuggestedBinding(squeezeClickAction, squeezeClickPath[SIDE_RIGHT]);
         bindings[n++] = ActionSuggestedBinding(thumbstickAction, thumbstickPosPath[SIDE_LEFT]);
         bindings[n++] = ActionSuggestedBinding(thumbstickAction, thumbstickPosPath[SIDE_RIGHT]);
         bindings[n++] = ActionSuggestedBinding(thumbstickClickAction, thumbstickClickPath[SIDE_LEFT]);
         bindings[n++] = ActionSuggestedBinding(thumbstickClickAction, thumbstickClickPath[SIDE_RIGHT]);
-        bindings[n++] = ActionSuggestedBinding(thumbstickTouchAction, thumbstickTouchPath[SIDE_LEFT]);
-        bindings[n++] = ActionSuggestedBinding(thumbstickTouchAction, thumbstickTouchPath[SIDE_RIGHT]);
         bindings[n++] = ActionSuggestedBinding(aimAction, aimPath[SIDE_LEFT]);
         bindings[n++] = ActionSuggestedBinding(aimAction, aimPath[SIDE_RIGHT]);
         bindings[n++] = ActionSuggestedBinding(gripAction, posePath[SIDE_LEFT]);
         bindings[n++] = ActionSuggestedBinding(gripAction, posePath[SIDE_RIGHT]);
         bindings[n++] = ActionSuggestedBinding(vibrateAction, hapticPath[SIDE_LEFT]);
         bindings[n++] = ActionSuggestedBinding(vibrateAction, hapticPath[SIDE_RIGHT]);
+        // Optional bindings last: if the runtime rejects the full set, SuggestBindings
+        // retries once without them (the last 4 entries).
+        int picoCore = n;
+        bindings[n++] = ActionSuggestedBinding(squeezeClickAction, squeezeClickPath[SIDE_LEFT]);
+        bindings[n++] = ActionSuggestedBinding(squeezeClickAction, squeezeClickPath[SIDE_RIGHT]);
+        bindings[n++] = ActionSuggestedBinding(thumbstickTouchAction, thumbstickTouchPath[SIDE_LEFT]);
+        bindings[n++] = ActionSuggestedBinding(thumbstickTouchAction, thumbstickTouchPath[SIDE_RIGHT]);
 
-        XrInteractionProfileSuggestedBinding sb = {0};
-        sb.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING;
-        sb.interactionProfile = profile;
-        sb.suggestedBindings = bindings;
-        sb.countSuggestedBindings = n;
-        sb.next = NULL;
-        result = xrSuggestInteractionProfileBindings(gAppState.Instance, &sb);
+        SuggestBindings(profile, "bytedance/pico4_controller", bindings, n, picoCore);
     }
 
     // ---- Khronos Simple controller (last-resort fallback) ----
@@ -416,8 +464,11 @@ void TBXR_InitActions( void )
         XrActionSuggestedBinding bindings[16];
         int n = 0;
         // KHR Simple only exposes select/click + menu/click + grip pose + haptic.
-        bindings[n++] = ActionSuggestedBinding(triggerTouchAction, selectClickPath[SIDE_LEFT]);
-        bindings[n++] = ActionSuggestedBinding(triggerTouchAction, selectClickPath[SIDE_RIGHT]);
+        // select/click is read as a trigger pull (see VrInput_EffectiveTrigger).  It used to
+        // be bound to triggerTouchAction, which nothing reads, so a runtime that fell back
+        // to this profile had no usable button at all.
+        bindings[n++] = ActionSuggestedBinding(selectAction, selectClickPath[SIDE_LEFT]);
+        bindings[n++] = ActionSuggestedBinding(selectAction, selectClickPath[SIDE_RIGHT]);
         bindings[n++] = ActionSuggestedBinding(backAction, menuClickPath[SIDE_LEFT]);
         bindings[n++] = ActionSuggestedBinding(backAction, menuClickPath[SIDE_RIGHT]);
         bindings[n++] = ActionSuggestedBinding(aimAction, aimPath[SIDE_LEFT]);
@@ -427,16 +478,8 @@ void TBXR_InitActions( void )
         bindings[n++] = ActionSuggestedBinding(vibrateAction, hapticPath[SIDE_LEFT]);
         bindings[n++] = ActionSuggestedBinding(vibrateAction, hapticPath[SIDE_RIGHT]);
 
-        XrInteractionProfileSuggestedBinding sb = {0};
-        sb.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING;
-        sb.interactionProfile = profile;
-        sb.suggestedBindings = bindings;
-        sb.countSuggestedBindings = n;
-        sb.next = NULL;
-        result = xrSuggestInteractionProfileBindings(gAppState.Instance, &sb);
+        SuggestBindings(profile, "khr/simple_controller", bindings, n, n);
     }
-
-    (void)result;
 
     // Create the per-hand grip + aim action spaces.
     XrActionSpaceCreateInfo actionSpaceInfo = {0};
@@ -461,7 +504,8 @@ void TBXR_InitActions( void )
     attachInfo.countActionSets = 1;
     attachInfo.actionSets = &actionSet;
     attachInfo.next = NULL;
-    CHECK_XRCMD(xrAttachSessionActionSets(gAppState.Session, &attachInfo));
+    XrResult attachResult = CHECK_XRCMD(xrAttachSessionActionSets(gAppState.Session, &attachInfo));
+    VrInputDiag_AttachResult((int)attachResult, XrResultName(attachResult));
 }
 
 static void TBXR_SyncActions( void )
@@ -476,7 +520,8 @@ static void TBXR_SyncActions( void )
         syncInfo.countActiveActionSets = 1;
         syncInfo.activeActionSets = &activeActionSet;
         syncInfo.next = NULL;
-        xrSyncActions(gAppState.Session, &syncInfo);
+        XrResult syncResult = xrSyncActions(gAppState.Session, &syncInfo);
+        VrInputDiag_SyncResult((int)syncResult, XrResultName(syncResult));
     }
 }
 
@@ -554,6 +599,86 @@ static void TBXR_CheckControllers(void)
     }
 }
 
+// Diagnostics only: report the interaction profile the runtime actually bound
+// for each hand.  Polled at a low rate; logs only when the profile changes.
+static void TBXR_PollInteractionProfiles(void)
+{
+    static int calls = 0;
+    if ((calls++ % 30) != 0 || !VrInputDiag_Enabled())
+        return;
+
+    for (int hand = 0; hand < SIDE_COUNT; hand++)
+    {
+        XrInteractionProfileState profileState = { XR_TYPE_INTERACTION_PROFILE_STATE };
+        char pathString[128] = "";
+
+        if (XR_SUCCEEDED(xrGetCurrentInteractionProfile(gAppState.Session, handSubactionPath[hand], &profileState)) &&
+            profileState.interactionProfile != XR_NULL_PATH)
+        {
+            uint32_t length = 0;
+            xrPathToString(gAppState.Instance, profileState.interactionProfile, sizeof(pathString), &length, pathString);
+        }
+        VrInputDiag_Profile(hand, pathString);
+    }
+}
+
+// Read every action for one hand, build the Buttons bitmask from the shared
+// pure logic (VrInputLogic.h) and feed the diagnostics sample.
+static void TBXR_ReadHand(int hand, ovrInputStateTrackedRemote* out)
+{
+    XrActionStateBoolean sMenu   = GetActionStateBoolean(backAction, hand, "menu");
+    XrActionStateBoolean sFace1  = GetActionStateBoolean(hand == SIDE_LEFT ? XAction : AAction, hand, hand == SIDE_LEFT ? "x" : "a");
+    XrActionStateBoolean sFace2  = GetActionStateBoolean(hand == SIDE_LEFT ? YAction : BAction, hand, hand == SIDE_LEFT ? "y" : "b");
+    XrActionStateBoolean sStick  = GetActionStateBoolean(thumbstickClickAction, hand, "thumbstickclick");
+    XrActionStateBoolean sSelect = GetActionStateBoolean(selectAction, hand, "select");
+    XrActionStateFloat   sGrip   = GetActionStateFloat(squeezeAction, hand, "squeeze");
+    XrActionStateFloat   sTrig   = GetActionStateFloat(triggerAction, hand, "trigger");
+    XrActionStateVector2f sJoy   = GetActionStateVector2(thumbstickAction, hand, "thumbstick");
+
+    vrRawHandInput_t raw;
+    raw.menu       = sMenu.currentState;
+    raw.face1      = sFace1.currentState;
+    raw.face2      = sFace2.currentState;
+    raw.stickClick = sStick.currentState;
+    raw.select     = sSelect.currentState;
+    raw.grip       = sGrip.currentState;
+    if (gAppState.controllersPresent == VIVE_CONTROLLERS)
+        raw.grip = GetActionStateBoolean(squeezeClickAction, hand, "squeezeclick").currentState;
+    raw.trigger    = sTrig.currentState;
+
+    out->Buttons = VrInput_ComposeButtons(hand, &raw);
+    out->Touches = 0;
+    out->GripTrigger = raw.grip;
+    out->IndexTrigger = VrInput_EffectiveTrigger(&raw);
+    out->Joystick.x = sJoy.currentState.x;
+    out->Joystick.y = sJoy.currentState.y;
+
+    if (VrInputDiag_Enabled())
+    {
+        vrDiagHandSample_t sample;
+        float stickMagnitude = fmaxf(fabsf(sJoy.currentState.x), fabsf(sJoy.currentState.y));
+
+        sample.buttons = out->Buttons;
+        sample.isActive[VRDIAG_ACT_TRIGGER]    = sTrig.isActive;
+        sample.value[VRDIAG_ACT_TRIGGER]       = raw.trigger;
+        sample.isActive[VRDIAG_ACT_GRIP]       = sGrip.isActive;
+        sample.value[VRDIAG_ACT_GRIP]          = raw.grip;
+        sample.isActive[VRDIAG_ACT_FACE1]      = sFace1.isActive;
+        sample.value[VRDIAG_ACT_FACE1]         = (float)raw.face1;
+        sample.isActive[VRDIAG_ACT_FACE2]      = sFace2.isActive;
+        sample.value[VRDIAG_ACT_FACE2]         = (float)raw.face2;
+        sample.isActive[VRDIAG_ACT_MENU]       = sMenu.isActive;
+        sample.value[VRDIAG_ACT_MENU]          = (float)raw.menu;
+        sample.isActive[VRDIAG_ACT_STICKCLICK] = sStick.isActive;
+        sample.value[VRDIAG_ACT_STICKCLICK]    = (float)raw.stickClick;
+        sample.isActive[VRDIAG_ACT_SELECT]     = sSelect.isActive;
+        sample.value[VRDIAG_ACT_SELECT]        = (float)raw.select;
+        sample.isActive[VRDIAG_ACT_STICK]      = sJoy.isActive;
+        sample.value[VRDIAG_ACT_STICK]         = stickMagnitude;
+        VrInputDiag_HandSample(hand, &sample);
+    }
+}
+
 void TBXR_UpdateControllers( )
 {
     if (gAppState.Session == XR_NULL_HANDLE || gAppState.FrameState.predictedDisplayTime == 0) {
@@ -562,6 +687,8 @@ void TBXR_UpdateControllers( )
 
     TBXR_CheckControllers();
     TBXR_SyncActions();
+    TBXR_PollInteractionProfiles();
+    VrInputDiag_Heartbeat();
 
     // Get controller poses (aim + grip) for both hands.
     for (int i = 0; i < 2; i++) {
@@ -603,48 +730,7 @@ void TBXR_UpdateControllers( )
     leftRemoteTracking_new.Status = gAppState.TrackedController[0].Status;
     rightRemoteTracking_new.Status = gAppState.TrackedController[1].Status;
 
-    // ---- LEFT hand button bitmask ----
-    leftTrackedRemoteState_new.Buttons = 0;
-    leftTrackedRemoteState_new.Touches = 0;
-    if (GetActionStateBoolean(backAction, SIDE_LEFT).currentState)            leftTrackedRemoteState_new.Buttons |= xrButton_Enter;
-    if (GetActionStateBoolean(XAction, SIDE_LEFT).currentState)               leftTrackedRemoteState_new.Buttons |= xrButton_X;
-    if (GetActionStateBoolean(YAction, SIDE_LEFT).currentState)               leftTrackedRemoteState_new.Buttons |= xrButton_Y;
-    if (GetActionStateBoolean(thumbstickClickAction, SIDE_LEFT).currentState) leftTrackedRemoteState_new.Buttons |= (xrButton_LThumb | xrButton_Joystick);
-
-    leftTrackedRemoteState_new.GripTrigger = GetActionStateFloat(squeezeAction, SIDE_LEFT).currentState;
-    if (gAppState.controllersPresent == VIVE_CONTROLLERS)
-        leftTrackedRemoteState_new.GripTrigger = GetActionStateBoolean(squeezeClickAction, SIDE_LEFT).currentState;
-    if (leftTrackedRemoteState_new.GripTrigger > 0.5f)
-        leftTrackedRemoteState_new.Buttons |= xrButton_GripTrigger;
-
-    leftTrackedRemoteState_new.IndexTrigger = GetActionStateFloat(triggerAction, SIDE_LEFT).currentState;
-    if (leftTrackedRemoteState_new.IndexTrigger > 0.5f)
-        leftTrackedRemoteState_new.Buttons |= xrButton_Trigger;
-
-    // ---- RIGHT hand button bitmask ----
-    rightTrackedRemoteState_new.Buttons = 0;
-    rightTrackedRemoteState_new.Touches = 0;
-    if (GetActionStateBoolean(backAction, SIDE_RIGHT).currentState)            rightTrackedRemoteState_new.Buttons |= xrButton_Enter;
-    if (GetActionStateBoolean(AAction, SIDE_RIGHT).currentState)               rightTrackedRemoteState_new.Buttons |= xrButton_A;
-    if (GetActionStateBoolean(BAction, SIDE_RIGHT).currentState)               rightTrackedRemoteState_new.Buttons |= xrButton_B;
-    if (GetActionStateBoolean(thumbstickClickAction, SIDE_RIGHT).currentState) rightTrackedRemoteState_new.Buttons |= (xrButton_RThumb | xrButton_Joystick);
-
-    rightTrackedRemoteState_new.GripTrigger = GetActionStateFloat(squeezeAction, SIDE_RIGHT).currentState;
-    if (gAppState.controllersPresent == VIVE_CONTROLLERS)
-        rightTrackedRemoteState_new.GripTrigger = GetActionStateBoolean(squeezeClickAction, SIDE_RIGHT).currentState;
-    if (rightTrackedRemoteState_new.GripTrigger > 0.5f)
-        rightTrackedRemoteState_new.Buttons |= xrButton_GripTrigger;
-
-    rightTrackedRemoteState_new.IndexTrigger = GetActionStateFloat(triggerAction, SIDE_RIGHT).currentState;
-    if (rightTrackedRemoteState_new.IndexTrigger > 0.5f)
-        rightTrackedRemoteState_new.Buttons |= xrButton_Trigger;
-
-    // ---- Thumbsticks ----
-    XrActionStateVector2f js;
-    js = GetActionStateVector2(thumbstickAction, SIDE_LEFT);
-    leftTrackedRemoteState_new.Joystick.x = js.currentState.x;
-    leftTrackedRemoteState_new.Joystick.y = js.currentState.y;
-    js = GetActionStateVector2(thumbstickAction, SIDE_RIGHT);
-    rightTrackedRemoteState_new.Joystick.x = js.currentState.x;
-    rightTrackedRemoteState_new.Joystick.y = js.currentState.y;
+    // ---- Button bitmasks, triggers and thumbsticks (both hands) ----
+    TBXR_ReadHand(SIDE_LEFT, &leftTrackedRemoteState_new);
+    TBXR_ReadHand(SIDE_RIGHT, &rightTrackedRemoteState_new);
 }

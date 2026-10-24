@@ -21,6 +21,7 @@ EFXR_SurfaceView.c; the JNI VM/activity the loader needs come from gAppThread
 #include "VrCommon.h"
 #include "TBXR_Common.h"
 #include "VrCvars.h"
+#include "VrInputDiag.h"
 
 #include <time.h>
 #include <stdlib.h>
@@ -68,6 +69,17 @@ const char* const requiredExtensionNames[] = {
 
 const uint32_t numRequiredExtensions =
 		sizeof(requiredExtensionNames) / sizeof(requiredExtensionNames[0]);
+
+// Enabled only when the runtime advertises them.  The PICO 4 controller
+// interaction profile (/interaction_profiles/bytedance/pico4_controller) is
+// defined by XR_BD_controller_interaction; suggesting bindings for it without
+// the extension is rejected by the runtime.  Quest does not advertise it, so
+// nothing changes there.
+const char* const optionalExtensionNames[] = {
+		XR_BD_CONTROLLER_INTERACTION_EXTENSION_NAME};
+
+#define NUM_OPTIONAL_EXTENSIONS \
+		(sizeof(optionalExtensionNames) / sizeof(optionalExtensionNames[0]))
 
 // GLES3 exposes the FBO entry points as core (via <GLES3/gl3.h>), so unlike the
 // Windows/WGL build there are no extension pointers to resolve.  VR_Init still
@@ -1203,8 +1215,42 @@ void TBXR_InitialiseOpenXR()
 	instanceCreateInfo.applicationInfo = appInfo;
 	instanceCreateInfo.enabledApiLayerCount = 0;
 	instanceCreateInfo.enabledApiLayerNames = NULL;
-	instanceCreateInfo.enabledExtensionCount = numRequiredExtensions;
-	instanceCreateInfo.enabledExtensionNames = requiredExtensionNames;
+	// Required extensions plus any optional ones the runtime advertises.
+	const char* enabledExtensionNames[sizeof(requiredExtensionNames) / sizeof(requiredExtensionNames[0]) + NUM_OPTIONAL_EXTENSIONS];
+	uint32_t numEnabledExtensions = 0;
+	for (uint32_t i = 0; i < numRequiredExtensions; i++) {
+		enabledExtensionNames[numEnabledExtensions++] = requiredExtensionNames[i];
+	}
+	{
+		uint32_t availableCount = 0;
+		XrExtensionProperties* available = NULL;
+		if (XR_SUCCEEDED(xrEnumerateInstanceExtensionProperties(NULL, 0, &availableCount, NULL)) && availableCount > 0) {
+			available = (XrExtensionProperties*)calloc(availableCount, sizeof(XrExtensionProperties));
+			for (uint32_t i = 0; available != NULL && i < availableCount; i++) {
+				available[i].type = XR_TYPE_EXTENSION_PROPERTIES;
+			}
+			if (available != NULL &&
+				XR_FAILED(xrEnumerateInstanceExtensionProperties(NULL, availableCount, &availableCount, available))) {
+				availableCount = 0;
+			}
+		}
+		for (uint32_t o = 0; o < NUM_OPTIONAL_EXTENSIONS; o++) {
+			int found = 0;
+			for (uint32_t i = 0; available != NULL && i < availableCount; i++) {
+				if (strcmp(available[i].extensionName, optionalExtensionNames[o]) == 0) {
+					found = 1;
+					break;
+				}
+			}
+			if (found) {
+				enabledExtensionNames[numEnabledExtensions++] = optionalExtensionNames[o];
+			}
+			VrInputDiag_Extension(optionalExtensionNames[o], found);
+		}
+		free(available);
+	}
+	instanceCreateInfo.enabledExtensionCount = numEnabledExtensions;
+	instanceCreateInfo.enabledExtensionNames = enabledExtensionNames;
 
 	XrResult initResult;
 	gAppState.Instance = XR_NULL_HANDLE;
