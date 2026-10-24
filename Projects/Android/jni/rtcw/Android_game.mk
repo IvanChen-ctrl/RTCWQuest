@@ -49,6 +49,7 @@ GAME_FILES = \
   src/game/g_combat.c \
   src/game/g_items.c \
   src/game/g_main.c \
+  src/game/g_merc.c \
   src/game/g_mem.c \
   src/game/g_misc.c \
   src/game/g_missile.c \

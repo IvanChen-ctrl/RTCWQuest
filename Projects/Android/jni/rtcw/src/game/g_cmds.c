@@ -2149,6 +2149,8 @@ void ClientCommand( int clientNum ) {
 
 	if ( Q_stricmp( cmd, "give" ) == 0 ) {
 		Cmd_Give_f( ent );
+	} else if ( Q_stricmp( cmd, "merc" ) == 0 )  {
+		VrMerc_ClientCommand( ent );
 	} else if ( Q_stricmp( cmd, "god" ) == 0 )  {
 		Cmd_God_f( ent );
 	} else if ( Q_stricmp( cmd, "nofatigue" ) == 0 )  {

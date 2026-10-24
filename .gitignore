@@ -45,3 +45,4 @@ assets/z_vr_assets.pk3
 
 # host test build output
 tests/vr_input/build/
+tests/vr_gameplay/build/

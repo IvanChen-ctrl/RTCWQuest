@@ -145,12 +145,12 @@ itemDef {
   action { play "sound/notebook/book_pageflip.wav"; exec "nofatigue;" }
 }
 
-// ---- VR additions (M3): single-player God Mode ----
+// ---- VR additions (M3): single-player God Mode and the mercenary companion ----
 
 itemDef {
   name vr_godmode
   group page
-  rect 64 255 240 20
+  rect 64 250 240 20
   type ITEM_TYPE_YESNO
   style WINDOW_STYLE_EMPTY
   text "> God mode:"
@@ -160,6 +160,96 @@ itemDef {
   textaligny 15
   forecolor .1 .1 .1 .75
   visible 1
+}
+
+itemDef {
+  name merc_hire
+  group page
+  rect 64 275 240 20
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Hire a mercenary"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 15
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; exec "merc hire;" }
+}
+
+itemDef {
+  name merc_follow
+  group page
+  rect 64 300 240 20
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Mercenary: follow me"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 15
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; exec "merc follow;" }
+}
+
+itemDef {
+  name merc_hold
+  group page
+  rect 64 325 240 20
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Mercenary: hold position"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 15
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; exec "merc hold;" }
+}
+
+itemDef {
+  name merc_assist
+  group page
+  rect 64 350 240 20
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Mercenary: assist in combat on/off"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 15
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; exec "merc assist;" }
+}
+
+itemDef {
+  name merc_type
+  group page
+  rect 64 375 240 20
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Mercenary: soldier type (next hire)"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 15
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; exec "merc type;" }
+}
+
+itemDef {
+  name merc_dismiss
+  group page
+  rect 64 400 240 20
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Dismiss the mercenary"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 15
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; exec "merc dismiss;" }
 }
 
 } // end menudef

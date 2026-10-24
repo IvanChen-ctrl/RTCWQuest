@@ -1092,10 +1092,18 @@ extern vmCvar_t g_gameskill;
 
 extern vmCvar_t g_reloading;        //----(SA)	added
 
-// VR gameplay additions (g_vr.c)
+// VR gameplay additions (g_vr.c, g_merc.c)
 extern vmCvar_t vr_godmode;
+extern vmCvar_t vr_merc;
+extern vmCvar_t vr_merc_assist;
+extern vmCvar_t vr_merc_char;
 qboolean G_VrGodProtects( gentity_t *targ, int dflags );
 void     G_VrGodModeChanged( void );
+void     VrMerc_Init( void );
+void     VrMerc_Frame( void );
+void     VrMerc_ClientCommand( gentity_t *ent );
+qboolean VrMerc_IsMercEntity( int entnum );
+qboolean VrMerc_DamageBlocked( gentity_t *targ, gentity_t *attacker );
 
 extern vmCvar_t g_dedicated;
 extern vmCvar_t g_cheats;
