@@ -1,10 +1,11 @@
 # HANDOFF
 
-## Status (updated in M2A — read "Milestone 2A" at the bottom first)
-M0 (audit/docs) and M1A (CI workflow) are merged to `master` (PR #1, PR #2). The Actions build has succeeded twice.
-First real PICO 4 run: app starts, renders the menu, right controller moves the cursor with hover haptics, but no
-controller button activates anything. M2A (branch `claude/elegant-bardeen-ykx27m`) investigates and addresses that;
-it is NOT verified on hardware yet. The M0 and M1A sections below are kept as history and are partly stale.
+## Status (updated in M3 — read "Milestone 3" at the bottom first)
+M0 (audit/docs), M1A (CI workflow) and M2A (controller fixes) are merged to `master` (PR #1, #2, #3). On a real PICO 4 the
+menu and controller clicks work after M2A (owner report). M2B (PR #4, cinematic skip / pointer) is **not merged**: its
+cinematic fix did not pass physical validation; the existing cinematic can finish by itself and saved games load, so
+cinematic skipping is no longer a blocker. M3 (this branch) branches from `master`, not from M2B.
+The M0 and M1A sections below are kept as history and are partly stale.
 
 ## Start point
 - Upstream state: `master` @ `4c714b9163b0de94a856ac896c6cfa56a283de74` ("Fix Tesla and a Quest Permission Issue")
@@ -147,3 +148,46 @@ the first missing event in the trace identifies the broken link (`docs/INPUT_DIA
 - Do right-hand clicks via A/B/trigger and left Menu (Escape) all work once the PICO 4 profile is accepted?
 - `TBXR_CheckControllers` maps unknown profiles (including `khr/simple_controller`) to Touch semantics; harmless for
   buttons now, left unchanged.
+
+---
+
+## Milestone 3 — B-button jump, God Mode, AI mercenary companion
+
+Branch `pico4-m3-gameplay-mercenary-mvp`, from `master` @ `ceca712`. Full description, controls, limits and the headset
+checklist: `docs/M3_GAMEPLAY_MERCENARY.md`. **Nothing is verified on a headset.**
+
+### What exists in code
+- **Jump:** `VrInput_JumpStep` (`VrInputLogic.h`) replaces the raw K_SPACE event in `VrInputDefault.c`. Normal gameplay now
+  sends `+moveup`/`-moveup` (no dependency on a SPACE binding); camera sequences keep K_SPACE (stock skip); mounted gun
+  keeps `+activate`; the release always matches the press and is sent even if a menu/backpack zone becomes active.
+  The reason B did nothing on the headset is **not proven** (missing `SPACE -> +moveup` binding vs. dropped release; both
+  fixed). New log line `ev=jump route=... down=...`.
+- **God Mode:** cvar `vr_godmode` (default 0, not archived); toggle on the notebook "Private bucket list" page
+  (`z_vr_assets/ui/cheats.menu`) and console `vr_godmode 0|1`. `G_Damage` checks `G_VrGodProtects()` next to `FL_GODMODE`
+  (`g_vr.c`, `g_combat.c`); single-player human only; `DAMAGE_NO_PROTECTION` and tramcar crush still kill.
+- **Mercenary:** `g_merc.c` + `g_vrlogic.h`. Stock AICast character (American, Partisan fallback) spawned through
+  `AIChar_spawn`; follow = stock leader logic (`cs->leaderNum`), hold = stock wait goal, combat = stock AI. Supervisor
+  state machine FOLLOW/HOLD/ENGAGE/RETURN/DEAD/DISMISSED, validated spawn, duplicate prevention, bounded RETURN with
+  give-up + cooldown (no teleport), friendly-fire guard in `G_Damage`. Console `merc hire|follow|hold|assist|type|dismiss|status`
+  (also notebook buttons). Use-key on the mercenary toggles follow/hold.
+- **Save/load:** the companion (and a pending spawn) is skipped by `G_SaveGame` (`g_save.c`) because `G_LoadGame` aborts on
+  a saved client the new level did not create. The wish is the cvar `vr_merc`; level change / load re-hires a new one.
+
+### Tests (host, no SDK)
+`make -C tests/vr_input test` -> 139 checks, 0 failures (98 from M2A + 41). `make -C tests/vr_gameplay test` -> 480 checks,
+0 failures. Mutation checks (12 + 3) each make a test fail. Both run in `.github/workflows/input-host-tests.yml`.
+Edited game files were syntax-checked with host gcc against the real headers (`-include stddef.h -include stdint.h
+-DGAMEDLL`); the Actions Android build is the real compile check (see the pull request for the run).
+
+### Not done / unknown
+- Whether the American/Partisan models exist in the retail `pak0.pk3` (assumed from the source); `merc type partisan` switches.
+- Whether the notebook corner button that opens the "Private bucket list" page is reachable in VR (`visible 2`, unverified).
+- Whether the use key on the mercenary reaches the replaced activate hook (assumed from `AICast_Activate`).
+- No FPS or `gm:` measurements; method in the M3 doc (`com_speeds 1`).
+- One companion only; not persisted; no recovery teleport; HOLD does not leash an engaged chase.
+- Multiplayer/LAN co-op not started (out of scope).
+
+### Next session
+Owner builds the APK (Actions -> Android Debug APK -> this branch), runs the checklist in the M3 doc and returns the
+logcat (`adb logcat -s RTCWInput:I RTCW:I`). If B still does not jump, compare `ev=btn name=B` with `ev=jump`. If the
+mercenary does not appear, `merc status` and the `VR AI spawn ...` / `VR mercenary: ...` lines in the `RTCW` tag show where.
