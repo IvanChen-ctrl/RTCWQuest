@@ -387,6 +387,17 @@ void AICast_UpdateInput( cast_state_t *cs, int time ) {
 		cs->speedScale = 1.2;
 	}
 	//
+	// VR mercenary: the adaptive follow policy (g_merc.c) may guarantee a faster run so the companion can
+	// keep up with the player.  Only that companion has a non-zero floor.
+	{
+		float vrFloor = VrMerc_SpeedScaleFloor( cs->entityNum, cs->attributes[RUNNING_SPEED] );
+
+		if ( vrFloor > cs->speedScale ) {
+			cs->speedScale = vrFloor;
+			cs->actionFlags &= ~CASTACTION_WALK;
+		}
+	}
+	//
 	speed = cs->speedScale * cs->attributes[RUNNING_SPEED];
 	//
 	//if (speed <= (cs->attributes[WALKING_SPEED] + (cs->attributes[WALKING_SPEED] + 50 < cs->attributes[RUNNING_SPEED] ? 50 : -1)))	// do a fast shuffle if slightly over walking speed

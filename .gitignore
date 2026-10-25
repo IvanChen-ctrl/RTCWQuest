@@ -48,3 +48,4 @@ tests/vr_input/build/
 tests/vr_gameplay/build/
 tests/vr_lifecycle/build/
 tests/vr_tactics/build/
+tests/vr_squad/build/

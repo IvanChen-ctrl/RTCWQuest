@@ -15,9 +15,13 @@ on:
       - 'tests/vr_gameplay/**'
       - 'tests/vr_lifecycle/**'
       - 'tests/vr_tactics/**'
+      - 'tests/vr_squad/**'
       - 'Projects/Android/jni/RTCWVR/VrLifecycleLogic.h'
       - 'Projects/Android/jni/rtcw/src/game/g_vrlogic.h'
       - 'Projects/Android/jni/rtcw/src/game/g_vrtactics.h'
+      - 'Projects/Android/jni/rtcw/src/game/g_vrmove.h'
+      - 'Projects/Android/jni/rtcw/src/game/g_vrsquad.h'
+      - 'Projects/Android/jni/RTCWVR/VrCrouchLogic.h'
       - 'Projects/Android/jni/RTCWVR/VrInputLogic.h'
       - 'Projects/Android/jni/RTCWVR/VrInputDiag.c'
       - 'Projects/Android/jni/RTCWVR/VrInputDiag.h'
@@ -45,3 +49,6 @@ jobs:
 
       - name: Tactical mercenary AI (M4) host tests
         run: make -C tests/vr_tactics test
+
+      - name: Mercenary squad (follow policy, squad bookkeeping) host tests
+        run: make -C tests/vr_squad test
