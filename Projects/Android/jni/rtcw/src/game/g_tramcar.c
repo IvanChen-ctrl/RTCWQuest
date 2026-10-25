@@ -654,7 +654,8 @@ void Blocked_Tramcar( gentity_t *ent, gentity_t *other ) {
 		other->client->ps.stats[STAT_HEALTH] = other->health = 0;
 	}
 
-	G_Damage( other, ent, ent, NULL, NULL, 99999, 0, MOD_CRUSH );
+	// a tramcar crush is a scripted death: it still kills a player who has the VR God Mode option on
+	G_Damage( other, ent, ent, NULL, NULL, 99999, G_VrGodProtects( other, 0 ) ? DAMAGE_NO_PROTECTION : 0, MOD_CRUSH );
 
 }
 

@@ -1051,6 +1051,11 @@ void G_Damage( gentity_t *targ, gentity_t *inflictor, gentity_t *attacker,
 		}
 	}
 
+	// VR companion: never hurts the player or friendly NPCs, and is not hurt by the player's stray shots
+	if ( VrMerc_DamageBlocked( targ, attacker ) ) {
+		return;
+	}
+
 	if ( !dir ) {
 		dflags |= DAMAGE_NO_KNOCKBACK;
 	} else {
@@ -1125,6 +1130,11 @@ void G_Damage( gentity_t *targ, gentity_t *inflictor, gentity_t *attacker,
 
 		// check for godmode
 		if ( targ->flags & FL_GODMODE ) {
+			return;
+		}
+
+		// VR option "God Mode" (vr_godmode): same early-out as FL_GODMODE, single player only
+		if ( G_VrGodProtects( targ, dflags ) ) {
 			return;
 		}
 

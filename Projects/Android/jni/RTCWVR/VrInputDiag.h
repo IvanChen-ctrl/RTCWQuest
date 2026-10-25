@@ -59,6 +59,9 @@ void VrInputDiag_MenuHand(int cursorHand, int menuRightHanded, int controlsLeftH
 /* A controller button produced an engine key event (queued with Sys_QueEvent). */
 void VrInputDiag_KeyGenerated(int hand, int key, int down);
 
+/* The jump logic produced an action (route is a VRI_JUMP_ROUTE_* value). */
+void VrInputDiag_Jump(int route, int down);
+
 /* The engine dispatched a key event (called from CL_KeyEvent). */
 void VrInputDiag_KeyDelivered(int key, int down, int keyCatchers);
 

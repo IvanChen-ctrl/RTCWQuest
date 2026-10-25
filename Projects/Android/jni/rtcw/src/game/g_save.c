@@ -1514,6 +1514,9 @@ qboolean G_SaveGame( char *username ) {
 		if ( !ent->inuse || ent->s.number == ENTITYNUM_WORLD ) {
 			continue;
 		}
+		if ( VrMerc_IsMercEntity( i ) ) {   // the VR companion is never saved; it is re-hired after a load
+			continue;
+		}
 		if ( !G_SaveWrite( &i, sizeof( i ), f ) ) {
 			G_SaveWriteError();
 		}
@@ -1535,6 +1538,9 @@ qboolean G_SaveGame( char *username ) {
 		if ( cl->pers.connected != CON_CONNECTED ) {
 			continue;
 		}
+		if ( VrMerc_IsMercEntity( i ) ) {
+			continue;
+		}
 		if ( !G_SaveWrite( &i, sizeof( i ), f ) ) {
 			G_SaveWriteError();
 		}
@@ -1554,6 +1560,9 @@ qboolean G_SaveGame( char *username ) {
 	{
 		cs = &caststates[i];
 		if ( !g_entities[i].inuse ) {
+			continue;
+		}
+		if ( VrMerc_IsMercEntity( i ) ) {
 			continue;
 		}
 		if ( !G_SaveWrite( &i, sizeof( i ), f ) ) {

@@ -527,8 +527,8 @@ static void TBXR_SyncActions( void )
 
 void TBXR_ProcessHaptics(void)
 {
-    if (gAppState.Session == XR_NULL_HANDLE) {
-        return;
+    if (gAppState.Session == XR_NULL_HANDLE || !gAppState.SessionActive) {
+        return;     // no actions or haptics on a session that is not running (standby)
     }
 
     for (int hand = 0; hand < SIDE_COUNT; hand++) {
@@ -681,8 +681,9 @@ static void TBXR_ReadHand(int hand, ovrInputStateTrackedRemote* out)
 
 void TBXR_UpdateControllers( )
 {
-    if (gAppState.Session == XR_NULL_HANDLE || gAppState.FrameState.predictedDisplayTime == 0) {
-        return;
+    if (gAppState.Session == XR_NULL_HANDLE || !gAppState.SessionActive ||
+        gAppState.FrameState.predictedDisplayTime == 0) {
+        return;     // the controller state of the last frame is kept while the session is stopped
     }
 
     TBXR_CheckControllers();

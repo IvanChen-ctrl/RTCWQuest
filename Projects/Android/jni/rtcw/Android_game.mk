@@ -49,6 +49,7 @@ GAME_FILES = \
   src/game/g_combat.c \
   src/game/g_items.c \
   src/game/g_main.c \
+  src/game/g_merc.c \
   src/game/g_mem.c \
   src/game/g_misc.c \
   src/game/g_missile.c \
@@ -66,6 +67,7 @@ GAME_FILES = \
   src/game/g_tramcar.c \
   src/game/g_trigger.c \
   src/game/g_utils.c \
+  src/game/g_vr.c \
   src/game/g_weapon.c \
   src/game/q_math.c \
   src/game/q_shared.c \

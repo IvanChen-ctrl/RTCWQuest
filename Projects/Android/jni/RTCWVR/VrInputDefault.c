@@ -26,6 +26,35 @@ static inline float AngleBetweenVectors(const vec3_t a, const vec3_t b)
     return degrees(acosf(DotProduct(a, b)/(VectorLength(a) * VectorLength(b))));
 }
 
+void Sys_QueEvent( int time, sysEventType_t type, int value, int value2, int ptrLength, void *ptr );
+
+// Jump button state machine (see VrInputLogic.h).  Called every frame, in gameplay and
+// (with blocked set) in menus, so a held jump is always released and a press made
+// while blocked is never replayed later.
+static vrJumpState_t jumpState;
+
+static void sendJump(int buttonDown, int blocked)
+{
+    vrJumpAction_t action;
+
+    if (!VrInput_JumpStep(&jumpState, buttonDown, blocked, vr.mountedgun, cl.cameraMode, &action)) {
+        return;
+    }
+    VrInputDiag_Jump(action.route, action.down);
+    switch (action.route) {
+    case VRI_JUMP_ROUTE_ACTIVATE:
+        sendButtonAction("+activate", action.down);
+        break;
+    case VRI_JUMP_ROUTE_KEY:
+        // During a camera sequence SPACE is the stock "skip" key (cameraInterrupt in CL_KeyEvent).
+        Sys_QueEvent( 0, SE_KEY, K_SPACE, action.down, 0, NULL );
+        break;
+    default:
+        sendButtonAction("+moveup", action.down);
+        break;
+    }
+}
+
 void HandleInput_Default( ovrInputStateGamepad *pFootTrackingNew, ovrInputStateGamepad *pFootTrackingOld,
                           ovrInputStateTrackedRemote *pDominantTrackedRemoteNew, ovrInputStateTrackedRemote *pDominantTrackedRemoteOld, ovrTracking* pDominantTracking,
                           ovrInputStateTrackedRemote *pOffTrackedRemoteNew, ovrInputStateTrackedRemote *pOffTrackedRemoteOld, ovrTracking* pOffTracking,
@@ -148,6 +177,8 @@ void HandleInput_Default( ovrInputStateGamepad *pFootTrackingNew, ovrInputStateG
         }
         handleTrackedControllerButton(pOffTrackedRemoteNew, pOffTrackedRemoteOld, offButton2, K_ESCAPE);
         handleTrackedControllerButton(pDominantTrackedRemoteNew, pDominantTrackedRemoteOld, domButton2, K_ESCAPE);
+        // Keep the jump state current and release a jump held while the menu opened.
+        sendJump((primaryButtonsNew & primaryButton2) != 0, 1);
         if (vr_menu_item_touched->integer) {
             RTCWVR_Vibrate(40, vr.menu_right_handed ? 1 : 0, 0.5);
             Cvar_SetValue("vr_menu_item_touched", 0);
@@ -549,16 +580,8 @@ void HandleInput_Default( ovrInputStateGamepad *pFootTrackingNew, ovrInputStateG
                   positional_movementForward);
 
             //Jump (B Button)
-            if (vr.backpackitemactive != 2 && !canUseBackpack) {
-                if ((primaryButtonsNew & primaryButton2) != (primaryButtonsOld & primaryButton2))
-                {
-                    if (vr.mountedgun) {
-                        sendButtonAction("+activate", (primaryButtonsNew & primaryButton2) != 0);
-                    } else {
-                        Sys_QueEvent( 0, SE_KEY, K_SPACE, (primaryButtonsNew & primaryButton2) != 0, 0, NULL );
-                    }
-                }
-            }
+            sendJump((primaryButtonsNew & primaryButton2) != 0,
+                     vr.backpackitemactive == 2 || canUseBackpack);
 
 
 

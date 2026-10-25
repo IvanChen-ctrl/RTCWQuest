@@ -136,4 +136,70 @@ static inline int VrInput_MenuClickEvents(uint32_t newButtons, uint32_t oldButto
     return count;
 }
 
+/* ---- Jump (B button on the dominant hand, Y when sticks are switched) ----
+ *
+ * The jump used to be a raw K_SPACE key event, which only works when the
+ * player's config binds SPACE to +moveup.  Every other gameplay action of the
+ * VR layer (crouch, use, kick, attack) issues its +/- console command directly,
+ * so the jump now does too.  The route chosen at press time is latched so the
+ * release always matches the press, and a held jump is released whenever the
+ * jump becomes blocked (menu opened, hand moved into the backpack zone) so a
+ * +moveup can never stay stuck. */
+#define VRI_JUMP_ROUTE_NONE      0
+#define VRI_JUMP_ROUTE_MOVEUP    1   /* "+moveup" / "-moveup" console command      */
+#define VRI_JUMP_ROUTE_KEY       2   /* K_SPACE key event (cinematic interrupt)    */
+#define VRI_JUMP_ROUTE_ACTIVATE  3   /* "+activate" / "-activate" (mounted gun)    */
+
+typedef struct {
+    int heldRoute;   /* route used by the press that is still active          */
+    int prevDown;    /* button state seen by the previous step                */
+} vrJumpState_t;
+
+typedef struct {
+    int route;       /* VRI_JUMP_ROUTE_*                                      */
+    int down;        /* 1 = press, 0 = release                                */
+} vrJumpAction_t;
+
+/* One step per frame.  Writes at most one action to *out and returns 1 if it
+ * did.  `blocked` must be true whenever the jump must not act (menus, backpack
+ * zone, backpack weapon selection). */
+static inline int VrInput_JumpStep(vrJumpState_t *st, int buttonDown, int blocked,
+                                   int mountedGun, int cameraMode, vrJumpAction_t *out)
+{
+    int pressEdge = buttonDown && !st->prevDown;
+
+    st->prevDown = buttonDown ? 1 : 0;
+
+    if (!buttonDown) {
+        if (st->heldRoute != VRI_JUMP_ROUTE_NONE) {
+            out->route = st->heldRoute;
+            out->down = 0;
+            st->heldRoute = VRI_JUMP_ROUTE_NONE;
+            return 1;
+        }
+        return 0;
+    }
+
+    /* A press that starts while blocked is never replayed: only a press edge can
+     * start a jump, and prevDown stays set for as long as the button is held. */
+    if (blocked) {
+        if (st->heldRoute != VRI_JUMP_ROUTE_NONE) {
+            out->route = st->heldRoute;
+            out->down = 0;
+            st->heldRoute = VRI_JUMP_ROUTE_NONE;
+            return 1;
+        }
+        return 0;
+    }
+
+    if (pressEdge) {
+        st->heldRoute = mountedGun ? VRI_JUMP_ROUTE_ACTIVATE :
+                        (cameraMode ? VRI_JUMP_ROUTE_KEY : VRI_JUMP_ROUTE_MOVEUP);
+        out->route = st->heldRoute;
+        out->down = 1;
+        return 1;
+    }
+    return 0;
+}
+
 #endif /* VRINPUTLOGIC_H */

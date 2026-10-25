@@ -62,6 +62,10 @@ vmCvar_t g_gameskill;
 // done
 
 vmCvar_t g_reloading;       //----(SA)	added
+vmCvar_t vr_godmode;        // single-player God Mode (VR notebook / console), default off
+vmCvar_t vr_merc;           // companion requested for this session (hire/dismiss intent)
+vmCvar_t vr_merc_assist;    // companion may engage hostile targets
+vmCvar_t vr_merc_model;     // preferred model directory for the next hire ("" = automatic)
 
 vmCvar_t g_dmflags;
 vmCvar_t g_fraglimit;
@@ -161,6 +165,10 @@ cvarTable_t gameCvarTable[] = {
 	// done
 
 	{ &g_reloading, "g_reloading", "0", CVAR_ROM },   //----(SA)	added
+	{ &vr_godmode, "vr_godmode", "0", 0, 0, qfalse },
+	{ &vr_merc, "vr_merc", "0", 0, 0, qfalse },
+	{ &vr_merc_assist, "vr_merc_assist", "1", 0, 0, qfalse },
+	{ &vr_merc_model, "vr_merc_model", "", 0, 0, qfalse },
 
 // JPW NERVE multiplayer stuffs
 	{ &g_redlimbotime, "g_redlimbotime", "30000", CVAR_SERVERINFO | CVAR_LATCH, 0, qfalse },
@@ -1048,6 +1056,10 @@ void G_UpdateCvars( void ) {
 				}
 
 				// check for changed values for particular cvars
+				if ( !Q_stricmp( cv->cvarName, "vr_godmode" ) ) {
+					G_VrGodModeChanged();
+				}
+
 				if ( !Q_stricmp( cv->cvarName, "g_playerStart" ) ) {
 					gentity_t *player;
 					player = AICast_FindEntityForName( "player" );
@@ -1293,6 +1305,8 @@ void G_InitGame( int levelTime, int randomSeed, int restart ) {
 		// done.
 
 		AICast_ScriptLoad();
+
+		VrMerc_Init();
 
 		trap_Cvar_VariableStringBuffer( "g_missionStats", s, sizeof( s ) );
 		if ( strlen( s ) < 1 ) {
@@ -2617,6 +2631,9 @@ void G_RunFrame( int levelTime ) {
 	// Ridah, move the AI
 	AICast_StartServerFrame( level.time );
 	G_VRLogCastClientState( "after-ai" );
+
+	// VR companion supervisor (throttled internally)
+	VrMerc_Frame();
 
 //start = trap_Milliseconds();
 	// perform final fixups on the players

@@ -262,6 +262,151 @@ static void test_menu_click_from_simple_controller_select(void)
 
 /* ===================== VrInputDiag.c ===================== */
 
+
+/* ---- Jump (B button) routing ---- */
+
+typedef struct {
+    int route;
+    int down;
+} jumpEv_t;
+
+/* One frame of the jump state machine; returns 1 and fills *ev if it acted. */
+static int jumpFrame(vrJumpState_t *st, int down, int blocked, int mounted, int camera, jumpEv_t *ev)
+{
+    vrJumpAction_t a = {0, 0};
+    int acted = VrInput_JumpStep(st, down, blocked, mounted, camera, &a);
+    if (acted) {
+        ev->route = a.route;
+        ev->down = a.down;
+    }
+    return acted;
+}
+
+static void test_jump_press_release_uses_moveup(void)
+{
+    vrJumpState_t st;
+    jumpEv_t ev = {0, 0};
+    memset(&st, 0, sizeof(st));
+
+    CHECK(!jumpFrame(&st, 0, 0, 0, 0, &ev));                 /* idle: nothing */
+    CHECK(jumpFrame(&st, 1, 0, 0, 0, &ev));                  /* press */
+    CHECK(ev.route == VRI_JUMP_ROUTE_MOVEUP && ev.down == 1);
+    CHECK(!jumpFrame(&st, 1, 0, 0, 0, &ev));                 /* holding: no repeat events */
+    CHECK(!jumpFrame(&st, 1, 0, 0, 0, &ev));
+    CHECK(jumpFrame(&st, 0, 0, 0, 0, &ev));                  /* release ends the input */
+    CHECK(ev.route == VRI_JUMP_ROUTE_MOVEUP && ev.down == 0);
+    CHECK(!jumpFrame(&st, 0, 0, 0, 0, &ev));
+    CHECK(st.heldRoute == VRI_JUMP_ROUTE_NONE);
+}
+
+static void test_jump_does_not_depend_on_space_binding(void)
+{
+    /* Normal gameplay must never route through K_SPACE (needs a bind) ... */
+    vrJumpState_t st;
+    jumpEv_t ev = {0, 0};
+    memset(&st, 0, sizeof(st));
+    CHECK(jumpFrame(&st, 1, 0, 0, 0, &ev));
+    CHECK(ev.route != VRI_JUMP_ROUTE_KEY);
+    jumpFrame(&st, 0, 0, 0, 0, &ev);
+
+    /* ... while an in-engine cutscene keeps the stock SPACE "skip" behaviour. */
+    memset(&st, 0, sizeof(st));
+    CHECK(jumpFrame(&st, 1, 0, 0, 1, &ev));
+    CHECK(ev.route == VRI_JUMP_ROUTE_KEY && ev.down == 1);
+    CHECK(jumpFrame(&st, 0, 0, 0, 0, &ev));                  /* release matches the press route */
+    CHECK(ev.route == VRI_JUMP_ROUTE_KEY && ev.down == 0);
+}
+
+static void test_jump_mounted_gun_uses_activate(void)
+{
+    vrJumpState_t st;
+    jumpEv_t ev = {0, 0};
+    memset(&st, 0, sizeof(st));
+    CHECK(jumpFrame(&st, 1, 0, 1, 0, &ev));
+    CHECK(ev.route == VRI_JUMP_ROUTE_ACTIVATE && ev.down == 1);
+    /* the gun is dismounted while B is still held: the release still matches */
+    CHECK(jumpFrame(&st, 0, 0, 0, 0, &ev));
+    CHECK(ev.route == VRI_JUMP_ROUTE_ACTIVATE && ev.down == 0);
+}
+
+static void test_jump_blocked_press_is_ignored_until_release(void)
+{
+    vrJumpState_t st;
+    jumpEv_t ev = {0, 0};
+    memset(&st, 0, sizeof(st));
+
+    /* B pressed while the hand is in the backpack zone (selects an item) */
+    CHECK(!jumpFrame(&st, 1, 1, 0, 0, &ev));
+    /* the hand leaves the zone with B still held: must NOT start a jump now */
+    CHECK(!jumpFrame(&st, 1, 0, 0, 0, &ev));
+    CHECK(!jumpFrame(&st, 1, 0, 0, 0, &ev));
+    CHECK(!jumpFrame(&st, 0, 0, 0, 0, &ev));
+    /* a fresh press jumps normally */
+    CHECK(jumpFrame(&st, 1, 0, 0, 0, &ev));
+    CHECK(ev.down == 1);
+}
+
+static void test_jump_held_is_released_when_blocked(void)
+{
+    vrJumpState_t st;
+    jumpEv_t ev = {0, 0};
+    memset(&st, 0, sizeof(st));
+
+    CHECK(jumpFrame(&st, 1, 0, 0, 0, &ev));                  /* jump held */
+    /* menu opens (blocked) with B still down: the held +moveup is released once */
+    CHECK(jumpFrame(&st, 1, 1, 0, 0, &ev));
+    CHECK(ev.route == VRI_JUMP_ROUTE_MOVEUP && ev.down == 0);
+    CHECK(!jumpFrame(&st, 1, 1, 0, 0, &ev));                 /* no repeated release */
+    /* menu closes, B still physically down: no jump replay */
+    CHECK(!jumpFrame(&st, 1, 0, 0, 0, &ev));
+    CHECK(!jumpFrame(&st, 0, 0, 0, 0, &ev));
+    CHECK(st.heldRoute == VRI_JUMP_ROUTE_NONE);
+}
+
+static void test_jump_while_moving_is_independent_of_stick(void)
+{
+    /* The jump step takes no stick input at all: moving cannot suppress it. */
+    vrJumpState_t st;
+    jumpEv_t ev = {0, 0};
+    int presses = 0, releases = 0;
+    memset(&st, 0, sizeof(st));
+    for (int frame = 0; frame < 40; frame++) {
+        int down = (frame >= 5 && frame < 12) || (frame >= 20 && frame < 22);
+        if (jumpFrame(&st, down, 0, 0, 0, &ev)) {
+            if (ev.down) presses++; else releases++;
+        }
+    }
+    CHECK(presses == 2 && releases == 2);                    /* two taps, two clean releases */
+}
+
+static void test_jump_diag_line(void)
+{
+    resetDiag();
+    VrInputDiag_Jump(VRI_JUMP_ROUTE_MOVEUP, 1);
+    VrInputDiag_Jump(VRI_JUMP_ROUTE_MOVEUP, 0);
+    VrInputDiag_Jump(VRI_JUMP_ROUTE_KEY, 1);
+    VrInputDiag_Jump(VRI_JUMP_ROUTE_ACTIVATE, 1);
+    CHECK(linesContain("ev=jump route=moveup down=1"));
+    CHECK(linesContain("ev=jump route=moveup down=0"));
+    CHECK(linesContain("ev=jump route=key_space down=1"));
+    CHECK(linesContain("ev=jump route=activate down=1"));
+}
+
+static void test_jump_selects_same_button_as_crouch_partner(void)
+{
+    /* Default scheme: jump is face2 (B) of the dominant hand; the crouch uses face1 (A).
+     * Switched sticks: jump is Y on the left hand.  Both are plain bit tests. */
+    vrRawHandInput_t right, left;
+    memset(&right, 0, sizeof(right));
+    memset(&left, 0, sizeof(left));
+    right.face2 = 1;                                         /* B */
+    left.face2 = 1;                                          /* Y */
+    CHECK((VrInput_ComposeButtons(VRI_HAND_RIGHT, &right) & VRI_BTN_B) != 0);
+    CHECK((VrInput_ComposeButtons(VRI_HAND_RIGHT, &right) & VRI_BTN_A) == 0);
+    CHECK((VrInput_ComposeButtons(VRI_HAND_LEFT, &left) & VRI_BTN_Y) != 0);
+    CHECK((VrInput_ComposeButtons(VRI_HAND_LEFT, &left) & VRI_BTN_B) == 0);
+}
+
 static void test_diag_line_format(void)
 {
     resetDiag();
@@ -490,6 +635,15 @@ int main(void)
     test_menu_click_events();
     test_menu_click_from_trigger_values();
     test_menu_click_from_simple_controller_select();
+
+    test_jump_press_release_uses_moveup();
+    test_jump_does_not_depend_on_space_binding();
+    test_jump_mounted_gun_uses_activate();
+    test_jump_blocked_press_is_ignored_until_release();
+    test_jump_held_is_released_when_blocked();
+    test_jump_while_moving_is_independent_of_stick();
+    test_jump_selects_same_button_as_crouch_partner();
+    test_jump_diag_line();
 
     test_diag_line_format();
     test_diag_disabled_is_silent();
