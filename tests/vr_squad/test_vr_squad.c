@@ -837,6 +837,37 @@ static void test_squad_claim_penalty_is_bounded(void)
     CHECK(many > 0.0f);
 }
 
+
+static void test_dangerous_targets_take_no_claim_penalty(void)
+{
+    vrTacScoreParams_t p;
+    vrTacCand_t c;
+    float base;
+
+    p.stance = VRTAC_STANCE_DEFENSIVE;
+    p.coverMeActive = 0;
+
+    c = sq_cand(10, 500); c.targetsPlayer = 1;
+    base = VrTac_ThreatScore(&c, &p);
+    c.squadClaims = 2;
+    CHECK(VrTac_ThreatScore(&c, &p) == base);                       /* shooting at the player: concentrate */
+
+    c = sq_cand(10, 500); c.designated = 1;
+    base = VrTac_ThreatScore(&c, &p);
+    c.squadClaims = 2;
+    CHECK(VrTac_ThreatScore(&c, &p) == base);                       /* the player's own choice */
+
+    c = sq_cand(10, 500); c.msSinceHurtPlayer = 400;
+    base = VrTac_ThreatScore(&c, &p);
+    c.squadClaims = 2;
+    CHECK(VrTac_ThreatScore(&c, &p) == base);                       /* just hurt the player */
+
+    c = sq_cand(10, 500); c.msSinceHurtPlayer = 2500;               /* an old hit no longer counts as dangerous */
+    base = VrTac_ThreatScore(&c, &p);
+    c.squadClaims = 2;
+    CHECK(VrTac_ThreatScore(&c, &p) < base);
+}
+
 /* ===================== wounded / out of ammo ===================== */
 
 static void test_wounded_and_no_ammo_seek_cover(void)
@@ -997,6 +1028,7 @@ int main(void)
     test_squad_concentrates_on_the_dangerous_enemy();
     test_squad_single_enemy_all_engage();
     test_squad_claim_penalty_is_bounded();
+    test_dangerous_targets_take_no_claim_penalty();
     test_wounded_and_no_ammo_seek_cover();
     test_repeated_recruitment_and_limits();
     test_dismiss_all_then_rehire();
