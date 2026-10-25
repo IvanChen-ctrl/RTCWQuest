@@ -26,6 +26,7 @@
 
 	loadMenu { "ui/ingame_help.menu" }
 	loadMenu { "ui/cheats.menu" }
+	loadMenu { "ui/mercenary.menu" }
 
 	loadMenu { "ui/credits.menu" }
 	loadMenu { "ui/help_popup.menu"}

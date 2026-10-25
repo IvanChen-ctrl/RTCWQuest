@@ -62,6 +62,10 @@ void VrInputDiag_KeyGenerated(int hand, int key, int down);
 /* The jump logic produced an action (route is a VRI_JUMP_ROUTE_* value). */
 void VrInputDiag_Jump(int route, int down);
 
+/* The crouch button logic produced an action (VRI_DUCK_*): logged as
+ * ev=crouch action=pressed|released|forced_release|ignored button_source=A|X game_state=... */
+void VrInputDiag_Crouch(int action, const char *buttonSource, const char *gameState, int irlCrouch);
+
 /* The engine dispatched a key event (called from CL_KeyEvent). */
 void VrInputDiag_KeyDelivered(int key, int down, int keyCatchers);
 

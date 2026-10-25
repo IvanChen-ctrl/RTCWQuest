@@ -1,6 +1,6 @@
 # HANDOFF
 
-## Status (updated in M3 — read "Milestone 3" at the bottom first)
+## Status (updated in M4 — read "Milestone 4" at the bottom first, then "Milestone 3")
 M0 (audit/docs), M1A (CI workflow) and M2A (controller fixes) are merged to `master` (PR #1, #2, #3). On a real PICO 4 the
 menu and controller clicks work after M2A (owner report). M2B (PR #4, cinematic skip / pointer) is **not merged**: its
 cinematic fix did not pass physical validation; the existing cinematic can finish by itself and saved games load, so
@@ -207,3 +207,73 @@ Removed: the `OpenXRTestWakeLock` (kept `FLAG_KEEP_SCREEN_ON`).
 Owner builds the APK (Actions -> Android Debug APK -> this branch), runs the checklist in the M3 doc and returns the
 logcat (`adb logcat -s RTCWInput:I RTCW:I`). If B still does not jump, compare `ev=btn name=B` with `ev=jump`. If the
 mercenary does not appear, `merc status` and the `VR AI spawn ...` / `VR mercenary: ...` lines in the `RTCW` tag show where.
+
+---
+
+## Milestone 4 — tactical mercenary AI, M5 LAN co-op research
+
+Branch `pico4-m4-tactical-ai`, **stacked on** `pico4-m3-gameplay-mercenary-mvp` (M3 PR #5 still open; the M4 PR targets the
+M3 branch, not `master`). Full description, state table, commands, limits and the 20-point headset checklist:
+`docs/M4_TACTICAL_AI.md`. M5 research: `docs/M5_PICO4_LAN_COOP_FEASIBILITY.md`. **Nothing is verified on a headset.**
+
+### What exists in code
+- `g_vrtactics.h` (new, pure): command validation, friend/foe classification, threat score, target selection with
+  commitment + hysteresis, damage windows, friendly-fire line test, formation slots, cover / flank / regroup entry and
+  exit rules, reason codes.
+- `g_merc.c`: tactical context from the companion's own sight memory (250 ms), target applied to the stock AI,
+  hold-fire when the player/an ally is in the line of fire, formation correction, designation by fire press
+  (`merc attack`), cover (stock hide pos + local samples, executed by `AIFunc_BattleTakeCoverStart`), bounded flank
+  (goal entity + stock chase), regroup/retreat (stock chase of the player), stances, `RTCWTactical` diagnostics.
+- `g_vrlogic.h`: `VRMERC_COVER/FLANK/REGROUP` appended (M3 numbering unchanged); the M3 machine leaves them alone.
+- UI: `z_vr_assets/ui/mercenary.menu` (10 buttons), link on the cheats page, registered in `ui/ingame.txt`.
+- Console: `merc attack [now] | cover | regroup | stance [defensive|aggressive]` added to the M3 commands.
+  Cvars `vr_merc_stance`, `vr_merc_diag`.
+- Savegames: the companion's temporary goal entities are now skipped like the companion.
+
+### Tests
+`make -C tests/vr_tactics test` -> 2625 checks, 0 failures (new). `vr_gameplay` 544, `vr_input` 139, `vr_lifecycle` 94, unchanged
+and passing. 40 deliberate mutations of the pure logic all fail a test. All four run in
+`.github/workflows/input-host-tests.yml`. `g_merc.c`, `g_combat.c`, `g_main.c`, `g_cmds.c`, `g_save.c` pass `gcc -fsyntax-only`
+against the real engine headers (zero warnings in `g_merc.c`). The Android build result is in the pull request.
+
+### Not done / unknown
+- No engine run of any M4 behaviour; all thresholds are first guesses. The stock AI interaction (calling
+  `AIFunc_BattleTakeCoverStart` / `AIFunc_ChaseGoalStart` from the supervisor) is the same pattern the stock use-order uses
+  but is unproven for these states.
+- Companion still not persisted; one companion; no splash-weapon friendly-fire handling; no reload-under-pressure trigger.
+- M5: research only, no multiplayer code. Key finding: the VR pose reaches the game module through a process-local global
+  (`gVR`, 100 uses), not through the protocol, so co-op needs a per-client pose path first. Recommended prototype host:
+  a PC dedicated server (Option B).
+
+### Next session
+Owner builds the APK from the M4 branch, runs the checklist (M4 doc section 12) and returns `adb logcat -s RTCWTactical:I RTCW:I`.
+If a behaviour is wrong, the `state`/`cover`/`flank`/`nav_failure` lines show which decision fired. Then: tune thresholds,
+or start M5.0 (host build of the server) if the owner approves.
+
+---
+
+## M4 hardware-feedback round — crouch, following, squad (same branch, PR #6)
+
+Owner's first PICO 4 test of M4: mercenary spawns, God Mode works; A did not crouch, only one mercenary, too slow, got lost,
+tactics weak. Details, causes, controls, diagnostics and the 21-point hardware plan: **`docs/M4_SQUAD_AND_MOVEMENT.md`**.
+**Everything is source-level and host-tested only; none of it is confirmed on the headset.**
+
+- **Crouch (read from source):** `vr_irl_crouch_enabled` defaults to 1 and `PM_CheckDuck`'s IRL branch returned before reading
+  `upmove < 0`, so `+movedown` did nothing; the press/release were also both gated by the backpack zone. Fixed with
+  `VrCrouchLogic.h` (shared by game/cgame) + `VrInput_DuckStep` (always-released latch) + `ev=crouch` in `RTCWInput`.
+- **Slow / lost (read from source):** stock AICast caps speed at speedScale 1.2 x run-animation speed (about 73-88% of the
+  player), and the leader chase stops at < 240 straight-line units without line of sight. Fixed (companion only) with
+  `g_vrmove.h`: path-distance NEAR/RUN/CATCHUP with hysteresis, a speed-floor hook in `ai_cast_think.c`, a bounded recovery
+  ladder (repath -> player's trail -> wait). No teleport. `vr_merc_move 0` restores the M3 behaviour.
+- **Squad:** `squad[4]` independent soldier records (unique AI names `vr_merc_1..4`), `vr_merc_squad` limit (default 2),
+  one recruit at a time, per-soldier/`all` addressing and a notebook selector, roles + single file in corridors, spread of
+  fire, wounded/no-ammo cover. `g_vrsquad.h` is the pure part.
+- **Tests:** `tests/vr_input` 53608, `vr_gameplay` 544, `vr_lifecycle` 94, `vr_tactics` 3042, `vr_squad` 653, all passing.
+  Mutation checks on the new pure logic caught all but equivalent mutants.
+- **Unknown until the headset test:** whether A now crouches, whether the speed floor looks right (foot sliding?), whether
+  CATCHUP/recovery keeps soldiers with the player through doors, how three soldiers perform, and the frame times.
+- **Not done:** teleport recovery (deliberately), companion persistence, per-soldier stance, splash-weapon friendly fire.
+
+Next session: owner builds the APK from the M4 branch, runs the plan, returns `adb logcat -s RTCWInput:I RTCWMerc:I
+RTCWTactical:I RTCWLifecycle:I RTCW:I` plus the frame-time table.
+

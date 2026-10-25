@@ -393,6 +393,22 @@ void VrInputDiag_Jump(int route, int down)
     VrInputDiag_Event("jump", "route=%s down=%d", name, down);
 }
 
+void VrInputDiag_Crouch(int action, const char *buttonSource, const char *gameState, int irlCrouch)
+{
+    const char *name = "none";
+
+    if (action == 1) {
+        name = "pressed";
+    } else if (action == 2) {
+        name = "released";
+    } else if (action == 3) {
+        name = "forced_release";
+    } else if (action == 4) {
+        name = "ignored";
+    }
+    VrInputDiag_Event("crouch", "action=%s button_source=%s game_state=%s irl=%d", name, buttonSource, gameState, irlCrouch);
+}
+
 void VrInputDiag_KeyDelivered(int key, int down, int keyCatchers)
 {
     const char *route;

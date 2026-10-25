@@ -62,7 +62,12 @@ typedef enum {
 	VRMERC_ENGAGE,      /* fighting a hostile target                             */
 	VRMERC_RETURN,      /* walking back to the player / hold position            */
 	VRMERC_DEAD,        /* killed in action (terminal until the next hire)       */
-	VRMERC_DISMISSED    /* dismissed by the player (terminal until next hire)    */
+	VRMERC_DISMISSED,   /* dismissed by the player (terminal until next hire)    */
+	/* M4 tactical maneuvers (see g_vrtactics.h).  They are entered and left only by the
+	 * tactical layer; VrMerc_NextState keeps them unchanged except for death/dismissal. */
+	VRMERC_COVER,       /* moving to / waiting in cover from the current threat   */
+	VRMERC_FLANK,       /* short move to a side position for a better line of fire */
+	VRMERC_REGROUP      /* going back to the player (command, retreat, isolated)  */
 } vrMercState_t;
 
 typedef enum {
@@ -105,7 +110,12 @@ typedef struct {
 
 static inline int VrMerc_StateIsActive( int state ) {
 	return state == VRMERC_FOLLOW || state == VRMERC_HOLD ||
-		   state == VRMERC_ENGAGE || state == VRMERC_RETURN;
+		   state == VRMERC_ENGAGE || state == VRMERC_RETURN ||
+		   state == VRMERC_COVER || state == VRMERC_FLANK || state == VRMERC_REGROUP;
+}
+
+static inline int VrMerc_StateIsManeuver( int state ) {
+	return state == VRMERC_COVER || state == VRMERC_FLANK || state == VRMERC_REGROUP;
 }
 
 static inline int VrMerc_StateAfterCombatOrReturn( const vrMercInput_t *in ) {
@@ -135,6 +145,11 @@ static inline vrMercResult_t VrMerc_NextState( int cur, const vrMercInput_t *in,
 	}
 	if ( in->dismissRequested ) {
 		r.state = VRMERC_DISMISSED;
+		return r;
+	}
+
+	/* a tactical maneuver is owned by the tactical layer (g_vrtactics.h) */
+	if ( VrMerc_StateIsManeuver( cur ) ) {
 		return r;
 	}
 
