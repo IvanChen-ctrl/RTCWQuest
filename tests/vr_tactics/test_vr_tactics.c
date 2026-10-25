@@ -692,6 +692,666 @@ static void test_terminal_states_never_revive(void)
     CHECK(VrMerc_NextState(VRMERC_NONE, &in, 0).state == VRMERC_NONE);
 }
 
+
+/* ===================== cover ===================== */
+
+static vrTacCoverCand_t good_cover(void)
+{
+    vrTacCoverCand_t c;
+
+    memset(&c, 0, sizeof(c));
+    c.reachable = 1;
+    c.travelTime = 150;
+    c.distFromSelf = 200;
+    c.distFromPlayer = 300;
+    c.distFromHold = 100;
+    c.concealed = 1;
+    c.threatCloser = -50;
+    return c;
+}
+
+static void test_cover_accepts_a_good_spot(void)
+{
+    vrTacCoverCand_t c = good_cover();
+
+    CHECK(VrTac_CoverReject(&c) == VRTAC_OK);
+    CHECK(VrTac_CoverScore(&c) > 0.0f);
+}
+
+static void test_cover_rejection_reasons(void)
+{
+    vrTacCoverCand_t c;
+
+    c = good_cover(); c.insideSolid = 1;
+    CHECK(VrTac_CoverReject(&c) == VRTAC_R_COVER_SOLID);
+    CHECK(VrTac_CoverScore(&c) < 0.0f);
+
+    c = good_cover(); c.reachable = 0;
+    CHECK(VrTac_CoverReject(&c) == VRTAC_R_COVER_UNREACHABLE);
+    c = good_cover(); c.travelTime = 0;
+    CHECK(VrTac_CoverReject(&c) == VRTAC_R_COVER_UNREACHABLE);
+    c = good_cover(); c.travelTime = VRTAC_COVER_MAX_TRAVEL + 1;
+    CHECK(VrTac_CoverReject(&c) == VRTAC_R_COVER_UNREACHABLE);
+
+    c = good_cover(); c.concealed = 0;
+    CHECK(VrTac_CoverReject(&c) == VRTAC_R_COVER_EXPOSED);
+
+    c = good_cover(); c.distFromSelf = VRTAC_COVER_MIN_DIST - 1;
+    CHECK(VrTac_CoverReject(&c) == VRTAC_R_COVER_TOO_CLOSE);
+    c = good_cover(); c.distFromSelf = VRTAC_COVER_MAX_DIST + 1;
+    CHECK(VrTac_CoverReject(&c) == VRTAC_R_COVER_TOO_FAR);
+
+    c = good_cover(); c.threatCloser = VRTAC_COVER_TOWARD_MAX + 1;
+    CHECK(VrTac_CoverReject(&c) == VRTAC_R_COVER_TOWARD_ENEMY);
+    c = good_cover(); c.threatCloser = VRTAC_COVER_TOWARD_MAX - 1;
+    CHECK(VrTac_CoverReject(&c) == VRTAC_OK);
+
+    c = good_cover(); c.blocksPlayer = 1;
+    CHECK(VrTac_CoverReject(&c) == VRTAC_R_COVER_BLOCKS_PLAYER);
+}
+
+static void test_cover_hold_leash_only_applies_to_hold(void)
+{
+    vrTacCoverCand_t c = good_cover();
+
+    c.distFromHold = VRTAC_COVER_HOLD_LEASH + 50;
+    c.holdOrder = 0;
+    CHECK(VrTac_CoverReject(&c) == VRTAC_OK);           /* following: the post is irrelevant */
+    c.holdOrder = 1;
+    CHECK(VrTac_CoverReject(&c) == VRTAC_R_COVER_HOLD_LEASH);
+    c.distFromHold = VRTAC_COVER_HOLD_LEASH - 1;
+    CHECK(VrTac_CoverReject(&c) == VRTAC_OK);
+}
+
+static void test_cover_crouch_in_place(void)
+{
+    vrTacCoverCand_t c = good_cover();
+
+    c.crouchHere = 1;
+    c.distFromSelf = 0;             /* already there: not "too close" */
+    c.threatCloser = 0;
+    CHECK(VrTac_CoverReject(&c) == VRTAC_OK);
+    /* but it still has to be hidden and must not block the player */
+    c.concealed = 0;
+    CHECK(VrTac_CoverReject(&c) == VRTAC_R_COVER_EXPOSED);
+    c.concealed = 1;
+    c.blocksPlayer = 1;
+    CHECK(VrTac_CoverReject(&c) == VRTAC_R_COVER_BLOCKS_PLAYER);
+}
+
+static void test_cover_scoring_preferences(void)
+{
+    vrTacCoverCand_t near_c = good_cover(), far_c = good_cover(), crouch = good_cover();
+    vrTacCoverCand_t closeToPlayer = good_cover(), farFromPlayer = good_cover(), toward = good_cover();
+
+    near_c.distFromSelf = 100; near_c.travelTime = 60;
+    far_c.distFromSelf = 500; far_c.travelTime = 300;
+    CHECK(VrTac_CoverScore(&near_c) > VrTac_CoverScore(&far_c));
+
+    crouch.crouchHere = 1; crouch.distFromSelf = 0; crouch.travelTime = 1;
+    CHECK(VrTac_CoverScore(&crouch) > VrTac_CoverScore(&near_c));
+
+    closeToPlayer.distFromPlayer = 200;
+    farFromPlayer.distFromPlayer = 900;
+    CHECK(VrTac_CoverScore(&closeToPlayer) > VrTac_CoverScore(&farFromPlayer));
+
+    toward.threatCloser = 50;
+    {
+        vrTacCoverCand_t ref = good_cover();
+
+        CHECK(VrTac_CoverScore(&toward) < VrTac_CoverScore(&ref));
+    }
+}
+
+static void test_cover_pick_best(void)
+{
+    float sc[4] = { -1, 80, 120, -1 };
+
+    CHECK(VrTac_PickBest(sc, 4) == 2);
+    sc[2] = -1; sc[1] = -1;
+    CHECK(VrTac_PickBest(sc, 4) == -1);     /* nothing usable: fall back to stock combat */
+    CHECK(VrTac_PickBest(sc, 0) == -1);
+}
+
+static vrTacCoverWant_t cover_want(void)
+{
+    vrTacCoverWant_t w;
+
+    memset(&w, 0, sizeof(w));
+    w.state = VRMERC_ENGAGE;
+    w.order = VRMERC_ORDER_FOLLOW;
+    w.stance = VRTAC_STANCE_DEFENSIVE;
+    w.assist = 1;
+    w.haveTarget = 1;
+    w.targetVisible = 1;
+    w.targetDist = 700;
+    w.healthFrac = 1.0f;
+    w.cooldownOk = 1;
+    return w;
+}
+
+static void test_want_cover_triggers(void)
+{
+    vrTacCoverWant_t w = cover_want();
+    int why;
+
+    CHECK(!VrTac_WantCover(&w, &why));                  /* calm fight: stay and shoot */
+    w.sustainedFire = 1;
+    CHECK(VrTac_WantCover(&w, &why) && why == VRTAC_R_SUSTAINED_FIRE);
+    w.sustainedFire = 0; w.heavyDamage = 1;
+    CHECK(VrTac_WantCover(&w, &why) && why == VRTAC_R_HEAVY_DAMAGE);
+
+    w = cover_want();
+    w.order = VRMERC_ORDER_HOLD;
+    CHECK(VrTac_WantCover(&w, &why) && why == VRTAC_R_EXPOSED_HOLD);
+    w.targetVisible = 0;
+    CHECK(!VrTac_WantCover(&w, &why));                  /* nothing to hide from */
+    w.targetVisible = 1; w.targetDist = 2000;
+    CHECK(!VrTac_WantCover(&w, &why));
+    w.targetDist = 700; w.stance = VRTAC_STANCE_AGGRESSIVE;
+    CHECK(!VrTac_WantCover(&w, &why));                  /* aggressive holders keep shooting */
+}
+
+static void test_want_cover_aggressive_shrugs_off_light_fire(void)
+{
+    vrTacCoverWant_t w = cover_want();
+    int why;
+
+    w.stance = VRTAC_STANCE_AGGRESSIVE;
+    w.sustainedFire = 1;
+    CHECK(!VrTac_WantCover(&w, &why));
+    w.healthFrac = 0.4f;
+    CHECK(VrTac_WantCover(&w, &why) && why == VRTAC_R_SUSTAINED_FIRE);
+    w.healthFrac = 1.0f; w.sustainedFire = 0; w.heavyDamage = 1;
+    CHECK(VrTac_WantCover(&w, &why));                   /* heavy damage always counts */
+}
+
+static void test_want_cover_gates(void)
+{
+    vrTacCoverWant_t base = cover_want(), w;
+    int why;
+
+    base.heavyDamage = 1;
+    w = base; w.assist = 0;           CHECK(!VrTac_WantCover(&w, &why));
+    w = base; w.scriptBusy = 1;       CHECK(!VrTac_WantCover(&w, &why));
+    w = base; w.haveTarget = 0;       CHECK(!VrTac_WantCover(&w, &why));
+    w = base; w.cooldownOk = 0;       CHECK(!VrTac_WantCover(&w, &why));
+    w = base; w.maneuverActive = 1;   CHECK(!VrTac_WantCover(&w, &why));
+    w = base; w.state = VRMERC_DEAD;  CHECK(!VrTac_WantCover(&w, &why));
+    w = base; w.state = VRMERC_NONE;  CHECK(!VrTac_WantCover(&w, &why));
+    w = base; w.state = VRMERC_REGROUP; CHECK(!VrTac_WantCover(&w, &why));
+    w = base; w.state = VRMERC_HOLD;  CHECK(VrTac_WantCover(&w, &why));
+    w = base; w.state = VRMERC_FOLLOW; CHECK(VrTac_WantCover(&w, &why));
+}
+
+static vrTacCoverState_t cover_state(void)
+{
+    vrTacCoverState_t c;
+
+    memset(&c, 0, sizeof(c));
+    c.msSinceDamage = 10000;
+    return c;
+}
+
+static void test_cover_exit_rules(void)
+{
+    vrTacCoverState_t c;
+
+    c = cover_state();
+    c.msInState = 1000;
+    CHECK(VrTac_CoverExit(&c) == VRTAC_OK);             /* walking to cover */
+    c.scriptBusy = 1;
+    CHECK(VrTac_CoverExit(&c) == VRTAC_R_SCRIPT);
+
+    c = cover_state(); c.msInState = VRTAC_COVER_MAX_MS;
+    CHECK(VrTac_CoverExit(&c) == VRTAC_R_TIMEOUT);
+
+    c = cover_state(); c.msInState = 2000; c.stalled = 1;
+    CHECK(VrTac_CoverExit(&c) == VRTAC_R_NAV_STALL);
+    c.arrived = 1; c.msSinceArrival = 100;              /* stall flag is meaningless once there */
+    CHECK(VrTac_CoverExit(&c) == VRTAC_OK);
+
+    c = cover_state(); c.msInState = 3000; c.msSinceTarget = VRTAC_COVER_TARGET_GONE_MS;
+    CHECK(VrTac_CoverExit(&c) == VRTAC_R_TARGET_LOST);
+
+    c = cover_state(); c.msInState = 4000; c.arrived = 1; c.msSinceArrival = VRTAC_COVER_LINGER_MS;
+    c.msSinceDamage = VRTAC_COVER_CALM_MS;
+    CHECK(VrTac_CoverExit(&c) == VRTAC_R_DONE);
+    c.msSinceDamage = VRTAC_COVER_CALM_MS - 1;          /* still being shot at: stay down */
+    CHECK(VrTac_CoverExit(&c) == VRTAC_OK);
+    c.msSinceDamage = 10000; c.msSinceArrival = VRTAC_COVER_LINGER_MS - 1;
+    CHECK(VrTac_CoverExit(&c) == VRTAC_OK);             /* minimum time in cover */
+}
+
+/* Under constant fire the cover cycle must be bounded by the cooldowns. */
+static void test_cover_cycle_is_bounded_under_constant_fire(void)
+{
+    vrTacCoverWant_t w = cover_want();
+    int now, coverUntil = 0, cooldownUntil = 0, entries = 0, why;
+
+    w.sustainedFire = 1;
+    for (now = 0; now < 120000; now += 100) {
+        w.cooldownOk = now >= cooldownUntil;
+        w.maneuverActive = now < coverUntil;
+        if (!w.maneuverActive && VrTac_WantCover(&w, &why)) {
+            entries++;
+            coverUntil = now + VRTAC_COVER_MAX_MS;                  /* worst case: full stay */
+            cooldownUntil = coverUntil + VRTAC_COVER_DONE_COOLDOWN;
+        }
+    }
+    CHECK(entries >= 1);
+    CHECK(entries <= 120000 / (VRTAC_COVER_MAX_MS + VRTAC_COVER_DONE_COOLDOWN) + 1);
+}
+
+/* ===================== flank ===================== */
+
+static void test_flank_point_geometry(void)
+{
+    float self[3] = { 500, 0, 10 }, enemy[3] = { 0, 0, 0 }, a[3], b[3];
+    float ra, rb, ang;
+
+    VrTac_FlankPoint(self, enemy, 1, 70.0f, a);
+    VrTac_FlankPoint(self, enemy, -1, 70.0f, b);
+    ra = sqrtf((a[0] - enemy[0]) * (a[0] - enemy[0]) + (a[1] - enemy[1]) * (a[1] - enemy[1]));
+    rb = sqrtf((b[0] - enemy[0]) * (b[0] - enemy[0]) + (b[1] - enemy[1]) * (b[1] - enemy[1]));
+    CHECK(fabsf(ra - 500.0f) < 0.1f && fabsf(rb - 500.0f) < 0.1f);      /* same distance from the enemy */
+    CHECK(a[1] * b[1] < 0.0f);                                           /* opposite sides */
+    CHECK(fabsf(a[1] + b[1]) < 0.01f);                                   /* mirror images */
+    ang = atan2f(a[1], a[0]) * 180.0f / 3.14159265f;
+    CHECK(fabsf(fabsf(ang) - 70.0f) < 0.1f);
+    CHECK(a[2] == 10);
+}
+
+static void test_flank_point_radius_is_clamped(void)
+{
+    float enemy[3] = { 0, 0, 0 }, near_self[3] = { 50, 0, 0 }, far_self[3] = { 5000, 0, 0 };
+    float p[3], r;
+
+    VrTac_FlankPoint(near_self, enemy, 1, 70.0f, p);
+    r = sqrtf(p[0] * p[0] + p[1] * p[1]);
+    CHECK(fabsf(r - 300.0f) < 0.1f);
+    VrTac_FlankPoint(far_self, enemy, 1, 70.0f, p);
+    r = sqrtf(p[0] * p[0] + p[1] * p[1]);
+    CHECK(fabsf(r - 600.0f) < 0.1f);
+    /* companion exactly on top of the enemy: still a finite, valid point */
+    VrTac_FlankPoint(enemy, enemy, 1, 70.0f, p);
+    CHECK(isfinite(p[0]) && isfinite(p[1]));
+}
+
+static void test_flank_fire_line_crossing(void)
+{
+    float player[3] = { 0, 0, 0 }, enemy[3] = { 1000, 0, 0 };
+    float self_above[3] = { 300, 400, 0 };
+    float side_same[3] = { 700, 450, 0 }, side_other[3] = { 700, -450, 0 };
+
+    /* staying on one side of the player's line of fire is fine */
+    CHECK(!VrTac_PathCrossesFireLine(self_above, side_same, player, enemy, VRTAC_FLANK_LINE_CLEAR));
+    /* a path that cuts across the line is not */
+    CHECK(VrTac_PathCrossesFireLine(self_above, side_other, player, enemy, VRTAC_FLANK_LINE_CLEAR));
+    /* a destination sitting on the line is not */
+    {
+        float on_line[3] = { 600, 20, 0 };
+
+        CHECK(VrTac_PathCrossesFireLine(self_above, on_line, player, enemy, VRTAC_FLANK_LINE_CLEAR));
+    }
+}
+
+static void test_flank_detour_rule(void)
+{
+    /* 300 units at 300 u/s is 1 s; a 2.0 ratio + 1.5 s slack allows 3.5 s = 350 (1/100 s) */
+    CHECK(VrTac_FlankDetourOk(100, 300.0f));
+    CHECK(VrTac_FlankDetourOk(350, 300.0f));
+    CHECK(!VrTac_FlankDetourOk(400, 300.0f));
+    CHECK(!VrTac_FlankDetourOk(0, 300.0f));
+    CHECK(!VrTac_FlankDetourOk(-5, 300.0f));
+    /* never longer than the hard limit, however far the straight distance */
+    CHECK(!VrTac_FlankDetourOk(VRTAC_FLANK_MAX_TRAVEL_MS / 10 + 1, 5000.0f));
+    CHECK(VrTac_FlankDetourOk(VRTAC_FLANK_MAX_TRAVEL_MS / 10, 5000.0f));
+}
+
+static vrTacFlankCand_t good_flank(void)
+{
+    vrTacFlankCand_t c;
+
+    memset(&c, 0, sizeof(c));
+    c.reachable = 1;
+    c.travelTime = 200;
+    c.straightDist = 400;
+    c.distToEnemy = 450;
+    c.shotFromPos = 1;
+    return c;
+}
+
+static void test_flank_candidate_rejections(void)
+{
+    vrTacFlankCand_t c;
+
+    c = good_flank();
+    CHECK(VrTac_FlankReject(&c) == VRTAC_OK);
+    CHECK(VrTac_FlankScore(&c) > 0.0f);
+    c = good_flank(); c.insideSolid = 1;
+    CHECK(VrTac_FlankReject(&c) == VRTAC_R_FLANK_SOLID);
+    c = good_flank(); c.reachable = 0;
+    CHECK(VrTac_FlankReject(&c) == VRTAC_R_FLANK_UNREACHABLE);
+    c = good_flank(); c.travelTime = 0;
+    CHECK(VrTac_FlankReject(&c) == VRTAC_R_FLANK_UNREACHABLE);
+    c = good_flank(); c.travelTime = 900;
+    CHECK(VrTac_FlankReject(&c) == VRTAC_R_FLANK_DETOUR);
+    c = good_flank(); c.distToEnemy = VRTAC_FLANK_MIN_AT_END - 1;
+    CHECK(VrTac_FlankReject(&c) == VRTAC_R_FLANK_TARGET_DIST);
+    c = good_flank(); c.crossesFireLine = 1;
+    CHECK(VrTac_FlankReject(&c) == VRTAC_R_FLANK_CROSSES_FIRE);
+    c = good_flank(); c.shotFromPos = 0;
+    CHECK(VrTac_FlankReject(&c) == VRTAC_R_FLANK_NO_SHOT);
+    CHECK(VrTac_FlankScore(&c) < 0.0f);
+}
+
+static vrTacFlankWant_t flank_want(void)
+{
+    vrTacFlankWant_t w;
+
+    memset(&w, 0, sizeof(w));
+    w.state = VRMERC_ENGAGE;
+    w.order = VRMERC_ORDER_FOLLOW;
+    w.stance = VRTAC_STANCE_AGGRESSIVE;
+    w.assist = 1;
+    w.haveTarget = 1;
+    w.targetDist = 600;
+    w.healthFrac = 1.0f;
+    w.msNoShot = 0;
+    w.msEngaged = 1000;
+    w.msSinceFlank = 1000000;
+    return w;
+}
+
+static void test_want_flank_requires_a_reason(void)
+{
+    vrTacFlankWant_t w = flank_want();
+    int trig;
+
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_R_FLANK_NONE);     /* available is not a reason */
+    w.msNoShot = VRTAC_FLANK_BLOCKED_MS;
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_OK && trig == VRTAC_R_LINE_OF_FIRE);
+    w.msNoShot = 0; w.msEngaged = VRTAC_FLANK_STALEMATE_MS;
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_OK && trig == VRTAC_R_AGGRESSIVE);
+}
+
+static void test_want_flank_defensive_is_more_patient(void)
+{
+    vrTacFlankWant_t w = flank_want();
+    int trig;
+
+    w.stance = VRTAC_STANCE_DEFENSIVE;
+    w.msEngaged = 60000;                                 /* long fight alone does not justify it */
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_R_FLANK_NONE);
+    w.msNoShot = VRTAC_FLANK_BLOCKED_MS;                 /* aggressive threshold is not enough */
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_R_FLANK_NONE);
+    w.msNoShot = VRTAC_FLANK_BLOCKED_DEF_MS;
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_OK && trig == VRTAC_R_LINE_OF_FIRE);
+}
+
+static void test_want_flank_gates(void)
+{
+    vrTacFlankWant_t base = flank_want(), w;
+    int trig;
+
+    base.msNoShot = 5000;
+    CHECK(VrTac_WantFlank(&base, &trig) == VRTAC_OK);
+
+    w = base; w.order = VRMERC_ORDER_HOLD;
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_R_FLANK_ORDER);       /* HOLD means hold */
+    w = base; w.coverMeActive = 1;
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_R_FLANK_ORDER);
+    w = base; w.healthFrac = VRTAC_FLANK_MIN_HEALTH - 0.01f;
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_R_FLANK_HEALTH);
+    w = base; w.msSinceFlank = VRTAC_FLANK_COOLDOWN_MS - 1;
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_R_FLANK_COOLDOWN);
+    w = base; w.msSinceFlank = VRTAC_FLANK_COOLDOWN_MS;
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_OK);
+    w = base; w.flankFails = VRTAC_FLANK_MAX_FAILS;
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_R_FLANK_FAILURES);
+    w = base; w.targetDist = VRTAC_FLANK_MIN_TARGET - 1;
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_R_FLANK_TARGET_DIST);
+    w = base; w.targetDist = VRTAC_FLANK_MAX_TARGET + 1;
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_R_FLANK_TARGET_DIST);
+    w = base; w.assist = 0;
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_R_FLANK_NONE);
+    w = base; w.haveTarget = 0;
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_R_FLANK_NONE);
+    w = base; w.scriptBusy = 1;
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_R_FLANK_NONE);
+    w = base; w.maneuverActive = 1;
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_R_FLANK_NONE);
+    w = base; w.state = VRMERC_COVER;
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_R_FLANK_NONE);        /* no flank from inside another maneuver */
+    w = base; w.state = VRMERC_DEAD;
+    CHECK(VrTac_WantFlank(&w, &trig) == VRTAC_R_FLANK_NONE);
+}
+
+static void test_flank_exit_rules(void)
+{
+    vrTacFlankState_t f;
+
+    memset(&f, 0, sizeof(f));
+    f.targetValid = 1; f.healthFrac = 1.0f; f.progress = VRTAC_OK; f.msSinceArrival = -1;
+    CHECK(VrTac_FlankExit(&f) == VRTAC_OK);
+    f.scriptBusy = 1;
+    CHECK(VrTac_FlankExit(&f) == VRTAC_R_SCRIPT);
+    f.scriptBusy = 0; f.targetValid = 0;
+    CHECK(VrTac_FlankExit(&f) == VRTAC_R_TARGET_LOST);           /* dead or invalid target cancels */
+    f.targetValid = 1; f.healthFrac = VRTAC_FLANK_ABORT_HEALTH - 0.01f;
+    CHECK(VrTac_FlankExit(&f) == VRTAC_R_HURT);
+    f.healthFrac = 1.0f; f.progress = VRTAC_R_NAV_STALL;
+    CHECK(VrTac_FlankExit(&f) == VRTAC_R_NAV_STALL);             /* repeated navigation failure cancels */
+    f.progress = VRTAC_R_TIMEOUT;
+    CHECK(VrTac_FlankExit(&f) == VRTAC_R_TIMEOUT);
+    f.progress = VRTAC_R_DONE; f.msSinceArrival = 0;
+    CHECK(VrTac_FlankExit(&f) == VRTAC_OK);                      /* dwell: fire from the new angle */
+    f.msSinceArrival = VRTAC_FLANK_DWELL_MS - 1;
+    CHECK(VrTac_FlankExit(&f) == VRTAC_OK);
+    f.msSinceArrival = VRTAC_FLANK_DWELL_MS;
+    CHECK(VrTac_FlankExit(&f) == VRTAC_R_DONE);
+}
+
+/* Repeated navigation failures stop flanking for good (until the failure counter resets). */
+static void test_flank_repeated_failure_cancels_the_feature(void)
+{
+    vrTacFlankWant_t w = flank_want();
+    int trig, attempts = 0, now;
+
+    w.msNoShot = 9000;
+    for (now = 0; now < 600000; now += 1000) {
+        w.msSinceFlank = (attempts == 0) ? 1000000 : now - 0;
+        if (attempts > 0) {
+            w.msSinceFlank = VRTAC_FLANK_COOLDOWN_MS;       /* cooldown always satisfied */
+        }
+        if (VrTac_WantFlank(&w, &trig) == VRTAC_OK) {
+            attempts++;
+            w.flankFails++;                                  /* every attempt fails */
+        }
+    }
+    CHECK(attempts == VRTAC_FLANK_MAX_FAILS);
+}
+
+/* The flank cooldown prevents continuous repositioning. */
+static void test_flank_cooldown_limits_the_rate(void)
+{
+    vrTacFlankWant_t w = flank_want();
+    int trig, now, last = -1000000, flanks = 0;
+
+    w.msNoShot = 9000;
+    for (now = 0; now < 300000; now += 250) {
+        w.msSinceFlank = now - last;
+        if (VrTac_WantFlank(&w, &trig) == VRTAC_OK) {
+            flanks++;
+            last = now;
+        }
+    }
+    CHECK(flanks >= 2);
+    CHECK(flanks <= 300000 / VRTAC_FLANK_COOLDOWN_MS + 1);
+}
+
+/* ===================== regroup / retreat ===================== */
+
+static vrTacRegroupWant_t regroup_want(void)
+{
+    vrTacRegroupWant_t w;
+
+    memset(&w, 0, sizeof(w));
+    w.state = VRMERC_ENGAGE;
+    w.order = VRMERC_ORDER_FOLLOW;
+    w.assist = 1;
+    w.haveTarget = 1;
+    w.healthFrac = 1.0f;
+    w.distToPlayer = 300;
+    w.msSinceRegroup = 1000000;
+    return w;
+}
+
+static void test_regroup_command(void)
+{
+    vrTacRegroupWant_t w = regroup_want();
+    int why;
+
+    CHECK(!VrTac_WantRegroup(&w, &why));
+    w.regroupRequested = 1;
+    CHECK(VrTac_WantRegroup(&w, &why) && why == VRTAC_R_COMMAND);
+    w.msSinceRegroup = 0;                    /* the cooldown does not block an explicit command */
+    CHECK(VrTac_WantRegroup(&w, &why) && why == VRTAC_R_COMMAND);
+    w.scriptBusy = 1;                        /* a mission script still wins */
+    CHECK(!VrTac_WantRegroup(&w, &why));
+    w.scriptBusy = 0; w.state = VRMERC_REGROUP;
+    CHECK(!VrTac_WantRegroup(&w, &why));     /* already regrouping */
+    w.state = VRMERC_DEAD;
+    CHECK(!VrTac_WantRegroup(&w, &why));
+}
+
+static void test_retreat_low_health_under_pressure(void)
+{
+    vrTacRegroupWant_t w = regroup_want();
+    int why;
+
+    w.healthFrac = 0.30f;
+    CHECK(!VrTac_WantRegroup(&w, &why));                 /* hurt but not under fire: no panic */
+    w.sustainedFire = 1;
+    CHECK(VrTac_WantRegroup(&w, &why) && why == VRTAC_R_LOW_HEALTH);
+    w.sustainedFire = 0; w.heavyDamage = 1;
+    CHECK(VrTac_WantRegroup(&w, &why) && why == VRTAC_R_LOW_HEALTH);
+    w.healthFrac = VRTAC_RETREAT_HEALTH;                 /* threshold is exclusive */
+    CHECK(!VrTac_WantRegroup(&w, &why));
+    w.healthFrac = 0.1f; w.haveTarget = 0;
+    CHECK(!VrTac_WantRegroup(&w, &why));                 /* nobody to retreat from */
+}
+
+static void test_hold_order_is_respected_except_for_safety(void)
+{
+    vrTacRegroupWant_t w = regroup_want();
+    int why;
+
+    w.order = VRMERC_ORDER_HOLD;
+    w.sustainedFire = 1;
+    w.healthFrac = 0.30f;                                /* retreats a FOLLOWING companion... */
+    CHECK(!VrTac_WantRegroup(&w, &why));                 /* ...but not one holding a post */
+    w.healthFrac = VRTAC_RETREAT_HOLD_HEALTH - 0.01f;    /* only near death */
+    CHECK(VrTac_WantRegroup(&w, &why) && why == VRTAC_R_LOW_HEALTH);
+    /* isolation never pulls a holding companion off its post */
+    w.healthFrac = 1.0f; w.distToPlayer = 5000;
+    CHECK(!VrTac_WantRegroup(&w, &why));
+}
+
+static void test_isolated_under_pressure(void)
+{
+    vrTacRegroupWant_t w = regroup_want();
+    int why;
+
+    w.distToPlayer = VRTAC_ISOLATED_DIST + 100;
+    CHECK(!VrTac_WantRegroup(&w, &why));                 /* far away but nobody is shooting */
+    w.sustainedFire = 1;
+    CHECK(VrTac_WantRegroup(&w, &why) && why == VRTAC_R_ISOLATED);
+    w.distToPlayer = VRTAC_ISOLATED_DIST - 100;
+    CHECK(!VrTac_WantRegroup(&w, &why));
+}
+
+static void test_regroup_cooldown_prevents_loops(void)
+{
+    vrTacRegroupWant_t w = regroup_want();
+    int why;
+
+    w.healthFrac = 0.2f; w.sustainedFire = 1;
+    w.msSinceRegroup = VRTAC_REGROUP_COOLDOWN_MS - 1;
+    CHECK(!VrTac_WantRegroup(&w, &why));
+    w.msSinceRegroup = VRTAC_REGROUP_COOLDOWN_MS;
+    CHECK(VrTac_WantRegroup(&w, &why));
+    w.maneuverActive = 1;
+    CHECK(!VrTac_WantRegroup(&w, &why));
+    w.maneuverActive = 0; w.scriptBusy = 1;
+    CHECK(!VrTac_WantRegroup(&w, &why));
+}
+
+static void test_regroup_exit_rules(void)
+{
+    vrTacRegroupState_t r;
+
+    memset(&r, 0, sizeof(r));
+    r.distToPlayer = 900;
+    CHECK(VrTac_RegroupExit(&r) == VRTAC_OK);
+    r.distToPlayer = VRTAC_REGROUP_ARRIVE_DIST;
+    CHECK(VrTac_RegroupExit(&r) == VRTAC_R_DONE);
+    r.distToPlayer = 900; r.progress = VRTAC_R_NAV_STALL;
+    CHECK(VrTac_RegroupExit(&r) == VRTAC_R_NAV_STALL);
+    r.progress = VRTAC_R_TIMEOUT;
+    CHECK(VrTac_RegroupExit(&r) == VRTAC_R_TIMEOUT);
+    r.scriptBusy = 1;
+    CHECK(VrTac_RegroupExit(&r) == VRTAC_R_SCRIPT);
+}
+
+/* Retreat -> regroup -> fight again may repeat, but never faster than the cooldown. */
+static void test_retreat_engage_loop_is_bounded(void)
+{
+    vrTacRegroupWant_t w = regroup_want();
+    int now, regroups = 0, until = 0, endedAt = 0, why;
+
+    w.healthFrac = 0.2f; w.sustainedFire = 1;               /* worst case: pressure never stops */
+    for (now = 0; now < 300000; now += 100) {
+        w.maneuverActive = now < until;
+        w.msSinceRegroup = endedAt ? now - endedAt : 1000000;
+        if (!w.maneuverActive && VrTac_WantRegroup(&w, &why)) {
+            regroups++;
+            until = now + VRTAC_REGROUP_MAX_MS;             /* worst case: full-length retreat */
+            endedAt = until;
+        }
+    }
+    CHECK(regroups >= 2);
+    CHECK(regroups <= 300000 / (VRTAC_REGROUP_MAX_MS + VRTAC_REGROUP_COOLDOWN_MS) + 1);
+}
+
+static void test_state_after_maneuver(void)
+{
+    CHECK(VrTac_StateAfterManeuver(VRMERC_ORDER_FOLLOW, 1, 1) == VRMERC_ENGAGE);
+    CHECK(VrTac_StateAfterManeuver(VRMERC_ORDER_HOLD, 1, 1) == VRMERC_ENGAGE);
+    CHECK(VrTac_StateAfterManeuver(VRMERC_ORDER_FOLLOW, 1, 0) == VRMERC_FOLLOW);
+    CHECK(VrTac_StateAfterManeuver(VRMERC_ORDER_HOLD, 1, 0) == VRMERC_HOLD);
+    CHECK(VrTac_StateAfterManeuver(VRMERC_ORDER_FOLLOW, 0, 1) == VRMERC_FOLLOW);    /* passive: never ENGAGE */
+    CHECK(VrTac_StateAfterManeuver(VRMERC_ORDER_HOLD, 0, 1) == VRMERC_HOLD);
+}
+
+/* Every maneuver has a way out: for each exit function some input leaves the state. */
+static void test_every_maneuver_can_end(void)
+{
+    vrTacCoverState_t c;
+    vrTacFlankState_t f;
+    vrTacRegroupState_t r;
+
+    memset(&c, 0, sizeof(c)); c.msInState = VRTAC_COVER_MAX_MS;
+    CHECK(VrTac_CoverExit(&c) != VRTAC_OK);
+    memset(&f, 0, sizeof(f)); f.targetValid = 1; f.healthFrac = 1; f.progress = VRTAC_R_TIMEOUT;
+    CHECK(VrTac_FlankExit(&f) != VRTAC_OK);
+    memset(&r, 0, sizeof(r)); r.progress = VRTAC_R_TIMEOUT; r.distToPlayer = 2000;
+    CHECK(VrTac_RegroupExit(&r) != VRTAC_OK);
+    /* and the hard time limits are finite */
+    CHECK(VRTAC_COVER_MAX_MS > 0 && VRTAC_FLANK_MAX_MS > 0 && VRTAC_REGROUP_MAX_MS > 0);
+}
+
 int main(void)
 {
     test_reason_names_are_complete_and_unique();
@@ -739,6 +1399,40 @@ int main(void)
     test_maneuver_state_is_left_alone_by_the_base_machine();
     test_maneuver_state_still_dies_and_is_dismissed();
     test_terminal_states_never_revive();
+
+    test_cover_accepts_a_good_spot();
+    test_cover_rejection_reasons();
+    test_cover_hold_leash_only_applies_to_hold();
+    test_cover_crouch_in_place();
+    test_cover_scoring_preferences();
+    test_cover_pick_best();
+    test_want_cover_triggers();
+    test_want_cover_aggressive_shrugs_off_light_fire();
+    test_want_cover_gates();
+    test_cover_exit_rules();
+    test_cover_cycle_is_bounded_under_constant_fire();
+
+    test_flank_point_geometry();
+    test_flank_point_radius_is_clamped();
+    test_flank_fire_line_crossing();
+    test_flank_detour_rule();
+    test_flank_candidate_rejections();
+    test_want_flank_requires_a_reason();
+    test_want_flank_defensive_is_more_patient();
+    test_want_flank_gates();
+    test_flank_exit_rules();
+    test_flank_repeated_failure_cancels_the_feature();
+    test_flank_cooldown_limits_the_rate();
+
+    test_regroup_command();
+    test_retreat_low_health_under_pressure();
+    test_hold_order_is_respected_except_for_safety();
+    test_isolated_under_pressure();
+    test_regroup_cooldown_prevents_loops();
+    test_regroup_exit_rules();
+    test_retreat_engage_loop_is_bounded();
+    test_state_after_maneuver();
+    test_every_maneuver_can_end();
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

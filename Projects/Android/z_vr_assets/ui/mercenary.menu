@@ -1,0 +1,224 @@
+#include "ui/menudef.h"
+{
+
+// M4: tactical orders for the mercenary companion (opened from the "Private bucket list" page).
+// Every button runs the console command shown in its action, so the same orders can be typed.
+menuDef {
+  name "mercenary"
+  visible 0
+  fullscreen 0
+  rect 0 0 640 480
+  focusColor 1 .75 0 1
+  style 1
+  border 1
+  onOpen { play "sound/notebook/book_open.wav" }
+  onESC { play "sound/notebook/book_close.wav" }
+
+itemDef {
+  name background
+  rect 20 30 600 420	// centered
+  style WINDOW_STYLE_SHADER
+  background "notebook1"
+  forecolor 0 0 0 1
+  visible 1
+  decoration
+}
+
+itemDef {
+  name button_back
+  text "Back"
+  type 1
+  textscale .25
+  group grpControlbutton
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_SHADER
+  background "ui/assets/bookmark_back.tga"
+  rect 400 436 64 34
+  textalign 1
+  textalignx 32
+  textaligny 30
+  forecolor 1 1 1 .7
+  backcolor .3 .3 .3 1
+  visible 1
+  action { close mercenary; open cheats }
+  mouseEnter { setitemcolor button_back backcolor .1 .37 .1 1 }
+  mouseExit { setitemcolor button_back backcolor .37 .1 .1 1 }
+}
+
+itemDef {
+  name title
+  group page
+  rect 64 66 500 30
+  text "MERCENARY ORDERS:"
+  textfont UI_FONT_HANDWRITING
+  textscale .35
+  forecolor .1 .1 .1 .75
+  visible 1
+  decoration
+}
+
+itemDef {
+  name hint
+  group page
+  rect 64 96 520 20
+  text "Close the notebook after a choice. Attack: aim, then pull the trigger."
+  textfont UI_FONT_HANDWRITING
+  textscale .22
+  textaligny 14
+  forecolor .1 .1 .1 .6
+  visible 1
+  decoration
+}
+
+itemDef {
+  name m_follow
+  group page
+  rect 64 140 270 26
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Follow me"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 18
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; exec "merc follow;" }
+}
+
+itemDef {
+  name m_hold
+  group page
+  rect 64 192 270 26
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Hold position"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 18
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; exec "merc hold;" }
+}
+
+itemDef {
+  name m_attack
+  group page
+  rect 64 244 270 26
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Attack my target"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 18
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; exec "merc attack;" }
+}
+
+itemDef {
+  name m_cover
+  group page
+  rect 64 296 270 26
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Cover me"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 18
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; exec "merc cover;" }
+}
+
+itemDef {
+  name m_regroup
+  group page
+  rect 64 348 270 26
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Regroup"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 18
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; exec "merc regroup;" }
+}
+
+itemDef {
+  name m_hire
+  group page
+  rect 340 140 250 26
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Hire a mercenary"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 18
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; exec "merc hire;" }
+}
+
+itemDef {
+  name m_defensive
+  group page
+  rect 340 192 250 26
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Defensive stance"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 18
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; exec "merc stance defensive;" }
+}
+
+itemDef {
+  name m_aggressive
+  group page
+  rect 340 244 250 26
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Aggressive stance"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 18
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; exec "merc stance aggressive;" }
+}
+
+itemDef {
+  name m_assist
+  group page
+  rect 340 296 250 26
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Assist on / off"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 18
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; exec "merc assist;" }
+}
+
+itemDef {
+  name m_dismiss
+  group page
+  rect 340 348 250 26
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Dismiss"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 18
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; exec "merc dismiss;" }
+}
+
+} // end menudef
+} // end all

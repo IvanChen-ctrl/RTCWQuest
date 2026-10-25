@@ -139,6 +139,17 @@ typedef struct {
 	vrTacDmgLog_t dmgPlayer;    // damage taken by the player
 	int hurtSelfBy, hurtSelfAt;
 	int hurtPlayerBy, hurtPlayerAt;
+	int manArrivedAt;           // when the current maneuver reached its destination (0 = not yet)
+	int manTarget;              // target the current maneuver was started for
+	int nextCoverSearch;
+	int coverCooldownUntil;
+	int coverFails;
+	int nextFlankSearch;
+	int lastFlankAt;
+	int lastFlankFailAt;
+	int flankFails;
+	int noShotSince;            // 0 = the committed target has a clear shot
+	int regroupEndAt;
 	int ffValue;                // scriptNoAttackTime value that WE set (0 = none)
 	int ffLogAt;
 	int nextFormationCheck;
@@ -639,16 +650,12 @@ void VrMerc_NoteDamage( gentity_t *targ, gentity_t *attacker, int damage ) {
 	}
 	if ( VrMerc_IsCompanion( targ ) ) {
 		VrTac_DmgAdd( &merc.dmgSelf, level.time, damage );
-		if ( attacker && attacker != targ ) {
-			merc.hurtSelfBy = attacker->s.number;
-			merc.hurtSelfAt = level.time;
-		}
+		merc.hurtSelfAt = level.time;
+		merc.hurtSelfBy = ( attacker && attacker != targ ) ? attacker->s.number : -1;
 	} else if ( targ->client && targ->s.number == 0 && !( targ->r.svFlags & SVF_CASTAI ) ) {
 		VrTac_DmgAdd( &merc.dmgPlayer, level.time, damage );
-		if ( attacker && attacker != targ ) {
-			merc.hurtPlayerBy = attacker->s.number;
-			merc.hurtPlayerAt = level.time;
-		}
+		merc.hurtPlayerAt = level.time;
+		merc.hurtPlayerBy = ( attacker && attacker != targ ) ? attacker->s.number : -1;
 	}
 }
 
@@ -875,6 +882,18 @@ static void VrMerc_Perceive( gentity_t *player, gentity_t *ent, cast_state_t *cs
 		}
 		merc.target = newTarget;
 		merc.targetSince = now;
+		merc.noShotSince = 0;
+	}
+
+	// line of fire to the committed target (one stock visibility check per scan)
+	if ( merc.target >= 0 && vr_merc_assist.integer ) {
+		if ( AICast_CheckAttack( cs, merc.target, qfalse ) ) {
+			merc.noShotSince = 0;
+		} else if ( !merc.noShotSince ) {
+			merc.noShotSince = now;
+		}
+	} else {
+		merc.noShotSince = 0;
 	}
 
 	// apply to the stock AI.  The stock acquisition keeps working; we replace its choice when it has
@@ -1052,18 +1071,41 @@ static void VrMerc_ManeuverFreeGoal( cast_state_t *cs ) {
 	}
 }
 
+static const char *VrMerc_ManName( int kind ) {
+	switch ( kind ) {
+	case MAN_REPOSITION:    return "reposition";
+	case MAN_COVER:         return "cover";
+	case MAN_FLANK:         return "flank";
+	case MAN_REGROUP:       return "regroup";
+	default:                return "none";
+	}
+}
+
 // Ends the current maneuver.  restore = hand control back to the standing order.
 static void VrMerc_ManeuverEnd( gentity_t *player, cast_state_t *cs, int reason, qboolean restore ) {
 	if ( merc.man.kind == MAN_NONE ) {
 		return;
 	}
-	VrTac_Log( 1, "maneuver_end", "kind=%d reason=%s took_ms=%d", merc.man.kind, VrTac_ReasonName( reason ),
-			   level.time - merc.man.startedAt );
+	VrTac_Log( 1, "maneuver_end", "kind=%s reason=%s took_ms=%d", VrMerc_ManName( merc.man.kind ),
+			   VrTac_ReasonName( reason ), level.time - merc.man.startedAt );
 	VrMerc_ManeuverFreeGoal( cs );
 	merc.man.kind = MAN_NONE;
 	if ( restore && cs && player ) {
 		VrMerc_ReapplyOrder( player, cs );
 	}
+}
+
+// Records a maneuver (no goal entity: cover and regroup are driven by stock AI functions).
+static void VrMerc_ManeuverMark( int kind, vec3_t pos, float reach, int maxMs, int reason, gentity_t *ent ) {
+	merc.man.kind = kind;
+	merc.man.goalEnt = -1;
+	VectorCopy( pos, merc.man.pos );
+	merc.man.startedAt = level.time;
+	merc.man.maxMs = maxMs;
+	merc.man.reach = reach;
+	merc.man.reason = reason;
+	merc.manArrivedAt = 0;
+	VrMerc_ProgressReset( &merc.man.progress, Distance( ent->r.currentOrigin, pos ), level.time );
 }
 
 static qboolean VrMerc_ManeuverBegin( gentity_t *ent, cast_state_t *cs, int kind, vec3_t pos, float reach,
@@ -1078,14 +1120,8 @@ static qboolean VrMerc_ManeuverBegin( gentity_t *ent, cast_state_t *cs, int kind
 	goal->r.ownerNum = ent->s.number;
 	G_SetOrigin( goal, pos );
 
-	merc.man.kind = kind;
+	VrMerc_ManeuverMark( kind, pos, reach, maxMs, reason, ent );
 	merc.man.goalEnt = goal->s.number;
-	VectorCopy( pos, merc.man.pos );
-	merc.man.startedAt = level.time;
-	merc.man.maxMs = maxMs;
-	merc.man.reach = reach;
-	merc.man.reason = reason;
-	VrMerc_ProgressReset( &merc.man.progress, Distance( ent->r.currentOrigin, pos ), level.time );
 
 	AIFunc_ChaseGoalStart( cs, goal->s.number, reach, qtrue );
 	return qtrue;
@@ -1492,6 +1528,11 @@ static void VrMerc_Adopt( gentity_t *player, gentity_t *ent ) {
 	merc.target = -1;
 	merc.designated = -1;
 	merc.hurtSelfBy = merc.hurtPlayerBy = -1;
+	merc.coverCooldownUntil = merc.coverFails = merc.nextCoverSearch = 0;
+	merc.lastFlankAt = merc.lastFlankFailAt = merc.flankFails = merc.nextFlankSearch = 0;
+	merc.noShotSince = merc.regroupEndAt = merc.coverMeUntil = 0;
+	merc.man.kind = MAN_NONE;
+	merc.man.goalEnt = -1;
 	VrTac_DmgReset( &merc.dmgSelf );
 	VrTac_DmgReset( &merc.dmgPlayer );
 	VrTac_Log( 1, "hired", "ent=%d character=%s stance=%s", ent->s.number, aiDefaults[merc.character].name,
@@ -1556,13 +1597,464 @@ static int VrMerc_TryHire( gentity_t *player ) {
 
 /*
 ===============
+M4 tactical layer, part 2: cover, flank, regroup / retreat.
+Entry decisions and exit rules are the pure functions in g_vrtactics.h; the code below
+gathers the engine facts (traces, AAS, the AI's sight memory) and calls the stock AI.
+===============
+*/
+static int VrMerc_CommittedTargetIndex( void ) {
+	int k;
+
+	for ( k = 0; k < mtx.n; k++ ) {
+		if ( mtx.cand[k].entNum == merc.target ) {
+			return k;
+		}
+	}
+	return -1;
+}
+
+static qboolean VrMerc_HaveTargetNow( gentity_t *ent, cast_state_t *cs ) {
+	return ( merc.target >= 0 || VrMerc_HostileAlive( ent, cs->enemyNum ) ) ? qtrue : qfalse;
+}
+
+// Hand the AI back after a maneuver and move to the matching base state.
+static void VrMerc_AfterManeuver( gentity_t *player, gentity_t *ent, cast_state_t *cs, int reason ) {
+	int next = VrTac_StateAfterManeuver( merc.order, vr_merc_assist.integer != 0, VrMerc_HaveTargetNow( ent, cs ) );
+
+	if ( merc.order == VRMERC_ORDER_HOLD ) {
+		VrMerc_ReapplyOrder( player, cs );          // walk back to the post
+	} else if ( next == VRMERC_ENGAGE && VrMerc_HostileAlive( ent, cs->enemyNum ) ) {
+		AIFunc_DefaultStart( cs );                  // continue the fight with the stock AI
+	} else {
+		VrMerc_ReapplyOrder( player, cs );
+	}
+	VrMerc_SetState( next, reason );
+	merc.stateChanges++;
+}
+
+// Ends whatever maneuver is running and puts the companion back on its standing order.
+static void VrMerc_CancelManeuver( gentity_t *player, gentity_t *ent, cast_state_t *cs, int reason ) {
+	if ( merc.man.kind == MAN_NONE ) {
+		return;
+	}
+	if ( VrMerc_StateIsManeuver( merc.state ) ) {
+		VrMerc_ManeuverEnd( player, cs, reason, qfalse );
+		VrMerc_AfterManeuver( player, ent, cs, reason );
+	} else {
+		VrMerc_ManeuverEnd( player, cs, reason, qtrue );
+	}
+}
+
+/*
+===============
+Cover
+===============
+*/
+static void VrMerc_FillCoverCand( gentity_t *player, gentity_t *ent, cast_state_t *cs, vec3_t pos,
+								  vec3_t threatPos, qboolean crouch, vrTacCoverCand_t *c, vec3_t outPos ) {
+	int why = VRTAC_OK, travel;
+
+	memset( c, 0, sizeof( *c ) );
+	c->holdOrder = ( merc.order == VRMERC_ORDER_HOLD );
+	if ( crouch ) {
+		// the stock check already proved that a crouching companion is hidden where it stands
+		VectorCopy( ent->r.currentOrigin, outPos );
+		c->crouchHere = 1;
+		c->reachable = 1;
+		c->travelTime = 1;
+		c->concealed = 1;
+	} else {
+		travel = VrMerc_NavCheck( player, ent, cs, pos, outPos, &why );
+		c->insideSolid = ( why == VRTAC_R_NAV_SOLID ) ? 1 : 0;
+		c->reachable = ( travel > 0 ) ? 1 : 0;
+		c->travelTime = travel > 0 ? travel : 0;
+		if ( c->insideSolid || !c->reachable ) {
+			return;     // no point spending a visibility trace on an unusable spot
+		}
+		c->concealed = AICast_VisibleFromPos( threatPos, merc.target, outPos, ent->s.number, qfalse ) ? 0 : 1;
+	}
+	c->distFromSelf = Distance( ent->r.currentOrigin, outPos );
+	c->distFromPlayer = Distance( player->r.currentOrigin, outPos );
+	c->distFromHold = Distance( merc.holdPos, outPos );
+	c->threatCloser = Distance( ent->r.currentOrigin, threatPos ) - Distance( outPos, threatPos );
+	{
+		float t;
+
+		c->blocksPlayer = ( c->distFromPlayer < VRTAC_COVER_PLAYER_CLEAR ||
+							VrTac_PointSegmentDist( player->r.currentOrigin, threatPos, outPos, &t ) < VRTAC_COVER_LINE_CLEAR ) ? 1 : 0;
+	}
+}
+
+static qboolean VrMerc_TryCover( gentity_t *player, gentity_t *ent, cast_state_t *cs ) {
+	vrTacCoverWant_t w;
+	int reason, k, idx, bestK = -1, cnt = 0, lastReject = VRTAC_R_COVER_NONE;
+	int now = level.time;
+	vec3_t threatPos, self, positions[10], stock;
+	vrTacCoverCand_t cc[10];
+	float scores[10];
+	qboolean crouchPick = qfalse;
+	static const float ringDeg[8] = { 0, 45, -45, 90, -90, 135, -135, 180 };
+
+	idx = VrMerc_CommittedTargetIndex();
+	memset( &w, 0, sizeof( w ) );
+	w.state = merc.state;
+	w.order = merc.order;
+	w.stance = merc.stance;
+	w.assist = vr_merc_assist.integer != 0;
+	w.scriptBusy = VrMerc_ScriptBusy( cs );
+	w.haveTarget = ( idx >= 0 ) ? 1 : 0;
+	w.targetVisible = ( idx >= 0 && mtx.cand[idx].visibleNow ) ? 1 : 0;
+	w.targetDist = ( idx >= 0 ) ? mtx.cand[idx].dist : 99999.0f;
+	w.sustainedFire = mtx.sustained;
+	w.heavyDamage = mtx.heavy;
+	w.healthFrac = mtx.healthFrac;
+	w.cooldownOk = ( now >= merc.coverCooldownUntil ) ? 1 : 0;
+	w.maneuverActive = ( merc.man.kind != MAN_NONE ) ? 1 : 0;
+	if ( !VrTac_WantCover( &w, &reason ) || now < merc.nextCoverSearch ) {
+		return qfalse;
+	}
+	merc.nextCoverSearch = now + VRTAC_COVER_SEARCH_MS;       // trace budget: one search per interval
+
+	VectorCopy( cs->vislist[merc.target].visible_pos, threatPos );      // the companion's own memory
+	if ( VectorLength( threatPos ) < 1.0f ) {
+		VectorCopy( g_entities[merc.target].r.currentOrigin, threatPos );
+	}
+	VectorCopy( ent->r.currentOrigin, self );
+
+	// 1. the engine's own choice: crouch where we stand, or an AAS route-table hiding spot
+	if ( AICast_GetTakeCoverPos( cs, merc.target, threatPos, stock ) ) {
+		VrMerc_FillCoverCand( player, ent, cs, stock, threatPos, cs->crouchHideFlag ? qtrue : qfalse, &cc[cnt], positions[cnt] );
+		cnt++;
+	}
+	// 2. a small ring of local samples, starting away from the threat
+	{
+		float baseYaw = atan2f( self[1] - threatPos[1], self[0] - threatPos[0] );
+
+		for ( k = 0; k < 8 && cnt < 10; k++ ) {
+			vec3_t p;
+			float a = baseYaw + ringDeg[k] * 3.14159265f / 180.0f;
+
+			p[0] = self[0] + cosf( a ) * 250.0f;
+			p[1] = self[1] + sinf( a ) * 250.0f;
+			p[2] = self[2];
+			VrMerc_FillCoverCand( player, ent, cs, p, threatPos, qfalse, &cc[cnt], positions[cnt] );
+			cnt++;
+		}
+	}
+	for ( k = 0; k < cnt; k++ ) {
+		int rej = VrTac_CoverReject( &cc[k] );
+
+		scores[k] = VrTac_CoverScore( &cc[k] );
+		if ( rej != VRTAC_OK ) {
+			lastReject = rej;
+			VrTac_Log( 2, "cover_rejected", "cand=%d reason=%s dist=%.0f", k, VrTac_ReasonName( rej ), cc[k].distFromSelf );
+		}
+	}
+	bestK = VrTac_PickBest( scores, cnt );
+	if ( bestK < 0 ) {
+		// no usable cover: keep fighting with the stock behaviour, try again later
+		merc.coverFails++;
+		merc.coverCooldownUntil = now + VRTAC_COVER_FAIL_COOLDOWN;
+		VrTac_Log( 1, "cover_none", "candidates=%d last_reject=%s trigger=%s", cnt, VrTac_ReasonName( lastReject ),
+				   VrTac_ReasonName( reason ) );
+		return qfalse;
+	}
+	crouchPick = cc[bestK].crouchHere ? qtrue : qfalse;
+
+	if ( cs->enemyNum != merc.target ) {
+		VrMerc_SetStockTarget( ent, cs, merc.target );
+	}
+	VectorCopy( positions[bestK], cs->takeCoverPos );
+	cs->crouchHideFlag = crouchPick;
+	cs->takeCoverTime = now + 3500;
+	AIFunc_BattleTakeCoverStart( cs );
+
+	VrMerc_ManeuverMark( MAN_COVER, positions[bestK], crouchPick ? 0.0f : 40.0f, VRTAC_COVER_MAX_MS, reason, ent );
+	merc.manArrivedAt = crouchPick ? now : 0;
+	merc.manTarget = merc.target;
+	VrMerc_SetState( VRMERC_COVER, reason );
+	merc.stateChanges++;
+	VrTac_Log( 1, "cover", "trigger=%s kind=%s dist=%.0f travel=%d score=%.0f candidates=%d target=%d",
+			   VrTac_ReasonName( reason ), crouchPick ? "crouch" : "move", cc[bestK].distFromSelf,
+			   cc[bestK].travelTime, scores[bestK], cnt, merc.target );
+	return qtrue;
+}
+
+static void VrMerc_CoverStep( gentity_t *player, gentity_t *ent, cast_state_t *cs ) {
+	vrTacCoverState_t st;
+	int now = level.time, why;
+	float dist;
+	vec3_t d;
+
+	VectorSubtract( ent->r.currentOrigin, merc.man.pos, d );
+	d[2] = 0;
+	dist = VectorLength( d );
+	if ( !merc.manArrivedAt && dist <= merc.man.reach + 24.0f ) {
+		merc.manArrivedAt = now;
+	}
+	memset( &st, 0, sizeof( st ) );
+	st.msInState = now - merc.man.startedAt;
+	st.arrived = merc.manArrivedAt ? 1 : 0;
+	st.msSinceArrival = merc.manArrivedAt ? now - merc.manArrivedAt : 0;
+	st.stalled = ( !merc.manArrivedAt && VrMerc_ProgressStalled( &merc.man.progress, dist, now, 24.0f, VRTAC_COVER_STALL_MS ) ) ? 1 : 0;
+	st.scriptBusy = VrMerc_ScriptBusy( cs );
+	st.msSinceTarget = now - merc.lastTargetTime;
+	st.msSinceDamage = now - merc.hurtSelfAt;
+	why = VrTac_CoverExit( &st );
+	if ( why == VRTAC_OK ) {
+		return;
+	}
+	if ( why == VRTAC_R_NAV_STALL ) {
+		merc.coverFails++;
+		merc.coverCooldownUntil = now + VRTAC_COVER_FAIL_COOLDOWN;
+		VrTac_Log( 1, "nav_failure", "maneuver=cover dist=%.0f", dist );
+	} else {
+		merc.coverCooldownUntil = now + VRTAC_COVER_DONE_COOLDOWN;
+		merc.coverFails = 0;
+	}
+	VrMerc_ManeuverEnd( player, cs, why, qfalse );
+	VrMerc_AfterManeuver( player, ent, cs, why );
+}
+
+/*
+===============
+Flank
+===============
+*/
+static qboolean VrMerc_TryFlank( gentity_t *player, gentity_t *ent, cast_state_t *cs ) {
+	vrTacFlankWant_t w;
+	int idx = VrMerc_CommittedTargetIndex(), trigger, why, side, ang, k, cnt = 0, best = -1;
+	int now = level.time;
+	vec3_t enemyPos, self, pos[4];
+	vrTacFlankCand_t cc[4];
+	float score[4];
+	static const float angles[2] = { VRTAC_FLANK_ANGLE_DEG, 100.0f };
+
+	if ( merc.flankFails && merc.lastFlankFailAt && now - merc.lastFlankFailAt > VRTAC_FLANK_FAILS_RESET_MS ) {
+		merc.flankFails = 0;
+	}
+	memset( &w, 0, sizeof( w ) );
+	w.state = merc.state;
+	w.order = merc.order;
+	w.stance = merc.stance;
+	w.assist = vr_merc_assist.integer != 0;
+	w.scriptBusy = VrMerc_ScriptBusy( cs );
+	w.coverMeActive = ( now < merc.coverMeUntil ) ? 1 : 0;
+	w.haveTarget = ( idx >= 0 && mtx.cand[idx].msSinceSeen <= 3000 ) ? 1 : 0;
+	w.targetDist = ( idx >= 0 ) ? mtx.cand[idx].dist : 0.0f;
+	w.healthFrac = mtx.healthFrac;
+	w.msNoShot = merc.noShotSince ? now - merc.noShotSince : 0;
+	w.msEngaged = now - merc.targetSince;
+	w.msSinceFlank = merc.lastFlankAt ? now - merc.lastFlankAt : 1000000;
+	w.flankFails = merc.flankFails;
+	w.maneuverActive = ( merc.man.kind != MAN_NONE ) ? 1 : 0;
+	why = VrTac_WantFlank( &w, &trigger );
+	if ( why != VRTAC_OK ) {
+		if ( why != VRTAC_R_FLANK_NONE ) {
+			VrTac_Log( 2, "flank_rejected", "reason=%s", VrTac_ReasonName( why ) );
+		}
+		return qfalse;
+	}
+	if ( now < merc.nextFlankSearch ) {
+		return qfalse;
+	}
+	merc.nextFlankSearch = now + 2000;
+
+	VectorCopy( mtx.cand[idx].visibleNow ? g_entities[merc.target].r.currentOrigin : cs->vislist[merc.target].visible_pos, enemyPos );
+	VectorCopy( ent->r.currentOrigin, self );
+
+	for ( ang = 0; ang < 2; ang++ ) {
+		for ( side = -1; side <= 1; side += 2 ) {
+			vec3_t p, floor, eye, chest;
+			trace_t tr;
+			int nav, nwhy;
+			vrTacFlankCand_t *c = &cc[cnt];
+
+			VrTac_FlankPoint( self, enemyPos, side, angles[ang], p );
+			memset( c, 0, sizeof( *c ) );
+			nav = VrMerc_NavCheck( player, ent, cs, p, floor, &nwhy );
+			c->insideSolid = ( nwhy == VRTAC_R_NAV_SOLID ) ? 1 : 0;
+			c->reachable = ( nav > 0 ) ? 1 : 0;
+			c->travelTime = nav > 0 ? nav : 0;
+			VectorCopy( floor, pos[cnt] );
+			if ( nav > 0 ) {
+				c->straightDist = Distance( self, floor );
+				c->distToEnemy = Distance( floor, enemyPos );
+				c->crossesFireLine = VrTac_PathCrossesFireLine( self, floor, player->r.currentOrigin, enemyPos,
+																VRTAC_FLANK_LINE_CLEAR );
+				VectorCopy( floor, eye );
+				eye[2] += 20;
+				VectorCopy( enemyPos, chest );
+				chest[2] += 20;
+				trap_Trace( &tr, eye, NULL, NULL, chest, ent->s.number, MASK_SHOT );
+				c->shotFromPos = ( tr.fraction >= 0.97f || tr.entityNum == merc.target ) ? 1 : 0;
+			}
+			score[cnt] = VrTac_FlankScore( c );
+			if ( score[cnt] < 0.0f ) {
+				VrTac_Log( 2, "flank_rejected", "cand=%d side=%d reason=%s", cnt, side, VrTac_ReasonName( VrTac_FlankReject( c ) ) );
+			}
+			cnt++;
+		}
+	}
+	for ( k = 0; k < cnt; k++ ) {
+		if ( score[k] > 0.0f && ( best < 0 || score[k] > score[best] ) ) {
+			best = k;
+		}
+	}
+	merc.lastFlankAt = now;       // starts the cooldown whether or not a flank was found
+	if ( best < 0 ) {
+		merc.flankFails++;
+		merc.lastFlankFailAt = now;
+		merc.lastFlankAt = now - VRTAC_FLANK_COOLDOWN_MS + VRTAC_FLANK_FAIL_COOLDOWN;
+		VrTac_Log( 1, "flank_cancelled", "reason=%s candidates=%d fails=%d", VrTac_ReasonName( VRTAC_R_FLANK_NONE ), cnt, merc.flankFails );
+		return qfalse;
+	}
+	if ( !VrMerc_ManeuverBegin( ent, cs, MAN_FLANK, pos[best], 48.0f, VRTAC_FLANK_MAX_MS, trigger ) ) {
+		return qfalse;
+	}
+	merc.manArrivedAt = 0;
+	merc.manTarget = merc.target;
+	VrMerc_SetState( VRMERC_FLANK, trigger );
+	merc.stateChanges++;
+	VrTac_Log( 1, "flank", "trigger=%s target=%d travel=%d dist_to_enemy=%.0f no_shot_ms=%d", VrTac_ReasonName( trigger ),
+			   merc.target, cc[best].travelTime, cc[best].distToEnemy, w.msNoShot );
+	return qtrue;
+}
+
+static void VrMerc_FlankStep( gentity_t *player, gentity_t *ent, cast_state_t *cs ) {
+	vrTacFlankState_t f;
+	int now = level.time, why, prog;
+
+	prog = VrMerc_ManeuverProgress( ent );
+	if ( prog == VRTAC_R_DONE && !merc.manArrivedAt ) {
+		merc.manArrivedAt = now;
+	}
+	memset( &f, 0, sizeof( f ) );
+	f.scriptBusy = VrMerc_ScriptBusy( cs );
+	f.targetValid = VrMerc_HostileAlive( ent, merc.manTarget ) ? 1 : 0;
+	f.healthFrac = mtx.healthFrac;
+	f.progress = merc.manArrivedAt ? VRTAC_R_DONE : prog;
+	f.msSinceArrival = merc.manArrivedAt ? now - merc.manArrivedAt : -1;
+	why = VrTac_FlankExit( &f );
+	if ( why == VRTAC_OK ) {
+		return;
+	}
+	if ( why == VRTAC_R_NAV_STALL || why == VRTAC_R_TIMEOUT ) {
+		merc.flankFails++;
+		merc.lastFlankFailAt = now;
+		VrTac_Log( 1, "nav_failure", "maneuver=flank reason=%s", VrTac_ReasonName( why ) );
+		VrTac_Log( 1, "flank_cancelled", "reason=%s fails=%d", VrTac_ReasonName( why ), merc.flankFails );
+	} else if ( why == VRTAC_R_DONE ) {
+		merc.flankFails = 0;
+	} else {
+		VrTac_Log( 1, "flank_cancelled", "reason=%s fails=%d", VrTac_ReasonName( why ), merc.flankFails );
+	}
+	VrMerc_ManeuverEnd( player, cs, why, qfalse );      // frees the goal entity
+	VrMerc_AfterManeuver( player, ent, cs, why );
+}
+
+/*
+===============
+Regroup / retreat: go back to the player through the stock chase (the same call the M3 RETURN
+state uses), with a hard time limit and a progress watchdog.
+===============
+*/
+static qboolean VrMerc_StartRegroup( gentity_t *player, gentity_t *ent, cast_state_t *cs, int reason ) {
+	if ( merc.man.kind != MAN_NONE ) {
+		VrMerc_ManeuverEnd( player, cs, VRTAC_R_ORDER_CHANGED, qfalse );
+	}
+	if ( merc.order == VRMERC_ORDER_HOLD ) {
+		// a safety retreat (or an explicit command) ends the post: the companion now stays with the player
+		// (otherwise it would walk straight back into the fire that made it retreat)
+		VrMerc_FreeHoldGoal( cs );
+		merc.order = VRMERC_ORDER_FOLLOW;
+		VrMerc_Message( "Mercenary: falling back to you" );
+	}
+	cs->followEntity = -1;
+	cs->leaderNum = player->s.number;
+	AIFunc_ChaseGoalStart( cs, player->s.number, 160, qtrue );
+
+	VrMerc_ManeuverMark( MAN_REGROUP, player->r.currentOrigin, 160.0f, VRTAC_REGROUP_MAX_MS, reason, ent );
+	merc.manTarget = -1;
+	VrMerc_SetState( VRMERC_REGROUP, reason );
+	merc.stateChanges++;
+	VrTac_Log( 1, "regroup", "trigger=%s dist_to_player=%.0f health=%.2f", VrTac_ReasonName( reason ),
+			   Distance( ent->r.currentOrigin, player->r.currentOrigin ), mtx.healthFrac );
+	return qtrue;
+}
+
+static qboolean VrMerc_TryRegroup( gentity_t *player, gentity_t *ent, cast_state_t *cs ) {
+	vrTacRegroupWant_t w;
+	int reason;
+
+	memset( &w, 0, sizeof( w ) );
+	w.state = merc.state;
+	w.order = merc.order;
+	w.assist = vr_merc_assist.integer != 0;
+	w.scriptBusy = VrMerc_ScriptBusy( cs );
+	w.regroupRequested = 0;     // commands start a regroup directly (VrMerc_ClientCommand)
+	w.haveTarget = VrMerc_HaveTargetNow( ent, cs ) ? 1 : 0;
+	w.sustainedFire = mtx.sustained;
+	w.heavyDamage = mtx.heavy;
+	w.healthFrac = mtx.healthFrac;
+	w.distToPlayer = Distance( ent->r.currentOrigin, player->r.currentOrigin );
+	w.msSinceRegroup = merc.regroupEndAt ? level.time - merc.regroupEndAt : 1000000;
+	w.maneuverActive = ( merc.man.kind != MAN_NONE ) ? 1 : 0;
+	if ( !VrTac_WantRegroup( &w, &reason ) ) {
+		return qfalse;
+	}
+	return VrMerc_StartRegroup( player, ent, cs, reason );
+}
+
+static void VrMerc_RegroupStep( gentity_t *player, gentity_t *ent, cast_state_t *cs ) {
+	vrTacRegroupState_t r;
+	int now = level.time, why;
+	float dist = Distance( ent->r.currentOrigin, player->r.currentOrigin );
+
+	memset( &r, 0, sizeof( r ) );
+	r.scriptBusy = VrMerc_ScriptBusy( cs );
+	r.distToPlayer = dist;
+	r.progress = VRTAC_OK;
+	if ( now - merc.man.startedAt >= merc.man.maxMs ) {
+		r.progress = VRTAC_R_TIMEOUT;
+	} else if ( VrMerc_ProgressStalled( &merc.man.progress, dist, now, 48.0f, VRTAC_REGROUP_STALL_MS ) ) {
+		r.progress = VRTAC_R_NAV_STALL;
+	}
+	why = VrTac_RegroupExit( &r );
+	if ( why == VRTAC_OK ) {
+		return;
+	}
+	if ( why == VRTAC_R_NAV_STALL || why == VRTAC_R_TIMEOUT ) {
+		VrTac_Log( 1, "nav_failure", "maneuver=regroup reason=%s dist=%.0f", VrTac_ReasonName( why ), dist );
+	}
+	merc.regroupEndAt = now;       // starts the cooldown that prevents retreat / engage loops
+	VrMerc_ManeuverEnd( player, cs, why, qfalse );
+	VrMerc_AfterManeuver( player, ent, cs, why );
+}
+
+/*
+===============
 VrMerc_Tactics
 
 Per-tick tactical decisions while the base state machine has no transition to make.
+Priority: running maneuver > regroup/retreat > cover > flank > formation.
 ===============
 */
 static void VrMerc_Tactics( gentity_t *player, gentity_t *ent, cast_state_t *cs ) {
-	if ( merc.man.kind == MAN_REPOSITION ) {
+	int now = level.time;
+
+	if ( merc.coverMeUntil && now >= merc.coverMeUntil ) {
+		merc.coverMeUntil = 0;
+		VrTac_Log( 1, "cover_me_end", "reason=timeout" );
+	}
+	// consistency guard: a maneuver state always has its maneuver record
+	if ( VrMerc_StateIsManeuver( merc.state ) && merc.man.kind == MAN_NONE ) {
+		VrTac_Log( 1, "recover", "state=%s reason=no_maneuver", VrMerc_StateName( merc.state ) );
+		VrMerc_AfterManeuver( player, ent, cs, VRTAC_R_DONE );
+		return;
+	}
+	switch ( merc.man.kind ) {
+	case MAN_REPOSITION: {
 		int why = VRTAC_OK;
 
 		if ( VrMerc_ScriptBusy( cs ) ) {
@@ -1578,6 +2070,25 @@ static void VrMerc_Tactics( gentity_t *player, gentity_t *ent, cast_state_t *cs 
 			}
 			VrMerc_ManeuverEnd( player, cs, why, qtrue );
 		}
+		return;
+	}
+	case MAN_COVER:
+		VrMerc_CoverStep( player, ent, cs );
+		return;
+	case MAN_FLANK:
+		VrMerc_FlankStep( player, ent, cs );
+		return;
+	case MAN_REGROUP:
+		VrMerc_RegroupStep( player, ent, cs );
+		return;
+	default:
+		break;
+	}
+	if ( !vr_merc_assist.integer ) {
+		VrMerc_Formation( player, ent, cs );
+		return;
+	}
+	if ( VrMerc_TryRegroup( player, ent, cs ) || VrMerc_TryCover( player, ent, cs ) || VrMerc_TryFlank( player, ent, cs ) ) {
 		return;
 	}
 	VrMerc_Formation( player, ent, cs );
@@ -1703,6 +2214,7 @@ static void VrMerc_Supervise( gentity_t *player ) {
 			merc.returnAllowedAt = now + VRMERC_RETURN_COOLDOWN_MS;
 			G_Printf( "VR mercenary: return stalled at %.0f units, holding for %d ms\n",
 					  distToTarget, VRMERC_RETURN_COOLDOWN_MS );
+			VrTac_Log( 1, "nav_failure", "maneuver=return dist=%.0f cooldown_ms=%d", distToTarget, VRMERC_RETURN_COOLDOWN_MS );
 		} else if ( merc.holdGoal >= 0 ) {
 			AIFunc_ChaseGoalStart( cs, merc.holdGoal, 128, qtrue );     // walk back to the post
 		}
@@ -1854,6 +2366,7 @@ void VrMerc_ClientCommand( gentity_t *ent ) {
 			VrMerc_Message( VrMerc_HireReasonText( result ) );
 			return;
 		}
+		VrTac_Log( 1, "order", "cmd=hire" );
 		trap_Cvar_Set( "vr_merc", "1" );        // remember the wish across level changes and loads
 		merc.nextThink = 0;
 	} else if ( !Q_stricmp( sub, "dismiss" ) ) {
@@ -1862,6 +2375,7 @@ void VrMerc_ClientCommand( gentity_t *ent ) {
 			trap_Cvar_Set( "vr_merc", "0" );
 			VrMerc_Message( "Mercenary: cancelled" );
 		} else if ( comp ) {
+			VrTac_Log( 1, "order", "cmd=dismiss" );
 			merc.dismissRequested = qtrue;
 			merc.nextThink = 0;
 		} else {
@@ -1943,6 +2457,43 @@ void VrMerc_ClientCommand( gentity_t *ent ) {
 		}
 		VrMerc_Message( pick < 0 ? "Mercenary: no usable soldier model (see log)" :
 					   va( "Mercenary model: %s", merc.cand[pick].model ) );
+	} else if ( !Q_stricmp( sub, "regroup" ) || !Q_stricmp( sub, "cover" ) ) {
+		qboolean cover = !Q_stricmp( sub, "cover" ) ? qtrue : qfalse;
+		vrTacOrderCtx_t octx = VrMerc_OrderContext( player );
+		cast_state_t *ccs;
+		float dist;
+
+		result = VrTac_ValidateCommand( cover ? VRTAC_CMD_COVER_ME : VRTAC_CMD_REGROUP, &octx );
+		if ( result != VRTAC_OK ) {
+			VrTac_Log( 1, "order_rejected", "cmd=%s reason=%s", cover ? "cover_me" : "regroup", VrTac_ReasonName( result ) );
+			VrMerc_Message( VrMerc_ReasonText( result ) );
+			return;
+		}
+		ccs = AICast_GetCastState( comp->s.number );
+		if ( VrMerc_ScriptBusy( ccs ) ) {
+			VrTac_Log( 1, "order_rejected", "cmd=%s reason=%s", cover ? "cover_me" : "regroup", VrTac_ReasonName( VRTAC_R_SCRIPT ) );
+			VrMerc_Message( "Mercenary: busy right now" );
+			return;
+		}
+		VrTac_Log( 1, "order", "cmd=%s", cover ? "cover_me" : "regroup" );
+		if ( merc.order == VRMERC_ORDER_HOLD ) {
+			VrMerc_SetOrder( player, comp, VRMERC_ORDER_FOLLOW, qfalse );   // leaves the post, ends any maneuver
+		} else if ( !cover || merc.man.kind == MAN_FLANK ) {
+			VrMerc_CancelManeuver( player, comp, ccs, VRTAC_R_ORDER_CHANGED );
+		}
+		dist = Distance( comp->r.currentOrigin, player->r.currentOrigin );
+		if ( cover ) {
+			merc.coverMeUntil = level.time + VRTAC_COVER_ME_MS;
+			VrMerc_Message( "Mercenary: covering you" );
+		}
+		if ( dist > ( cover ? 400.0f : VRTAC_REGROUP_ARRIVE_DIST ) ) {
+			VrMerc_StartRegroup( player, comp, ccs, VRTAC_R_COMMAND );
+			if ( !cover ) {
+				VrMerc_Message( "Mercenary: regrouping" );
+			}
+		} else if ( !cover ) {
+			VrMerc_Message( "Mercenary: already with you" );
+		}
 	} else if ( !Q_stricmp( sub, "stance" ) ) {
 		int aggressive;
 

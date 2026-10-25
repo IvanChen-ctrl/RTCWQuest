@@ -252,5 +252,20 @@ itemDef {
   action { play "sound/notebook/book_pageflip.wav"; exec "merc dismiss;" }
 }
 
+itemDef {
+  name merc_orders
+  group page
+  rect 330 380 270 26
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Mercenary orders >>"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 18
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; close cheats; open mercenary }
+}
+
 } // end menudef
 } // end all
