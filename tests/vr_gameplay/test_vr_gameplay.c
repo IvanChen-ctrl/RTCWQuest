@@ -87,6 +87,7 @@ static vrMercHireContext_t okContext(void)
     c.aiEnabled = 1;
     c.freeClientSlots = 8;
     c.navigationLoaded = 1;
+    c.modelUsable = 1;
     return c;
 }
 
@@ -116,6 +117,8 @@ static void test_hire_refusals(void)
     CHECK(VrMerc_CanHire(&c) == VRMERC_HIRE_NO_CLIENT_SLOT);
     c = okContext(); c.navigationLoaded = 0;
     CHECK(VrMerc_CanHire(&c) == VRMERC_HIRE_NO_NAVIGATION);
+    c = okContext(); c.modelUsable = 0;                     /* regression: "Failed to load animation scripts" */
+    CHECK(VrMerc_CanHire(&c) == VRMERC_HIRE_NO_MODEL);
 }
 
 static void test_hire_duplicate_prevention(void)
@@ -524,6 +527,96 @@ static void test_character_setting(void)
     CHECK(VrMerc_NextCharacterSetting(9) == 1);
 }
 
+/* ===================== model completeness (regression: fatal "Failed to load animation scripts") ===================== */
+
+static vrMercModelFiles_t completeSkeletal(void)
+{
+    vrMercModelFiles_t f;
+    memset(&f, 0, sizeof(f));
+    f.hasAnimCfg = 1;
+    f.hasAnimScript = 1;
+    f.hasBodySkin = 1;
+    f.hasBodyMesh = 1;
+    f.hasHeadSkin = 1;
+    return f;
+}
+
+static void test_model_complete_is_ok(void)
+{
+    vrMercModelFiles_t f = completeSkeletal();
+    CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_OK);
+
+    /* legacy md3 character: lower/upper parts instead of a skeletal body */
+    memset(&f, 0, sizeof(f));
+    f.hasAnimCfg = f.hasAnimScript = f.hasHeadSkin = 1;
+    f.hasLowerSkin = f.hasUpperSkin = f.hasLowerMesh = f.hasUpperMesh = 1;
+    CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_OK);
+}
+
+static void test_model_missing_animation_files_are_rejected(void)
+{
+    /* The exact headset failure: the server cannot open wolfanim.cfg / wolfanim.script. */
+    vrMercModelFiles_t f = completeSkeletal();
+    f.hasAnimCfg = 0;
+    CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_NO_ANIM_CFG);
+
+    f = completeSkeletal();
+    f.hasAnimScript = 0;
+    CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_NO_ANIM_SCRIPT);
+
+    /* nothing at all */
+    memset(&f, 0, sizeof(f));
+    CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_NO_ANIM_CFG);
+}
+
+static void test_model_missing_visual_files_are_rejected(void)
+{
+    vrMercModelFiles_t f = completeSkeletal();
+    f.hasBodyMesh = 0;                                      /* skin without mesh: invisible character */
+    CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_NO_BODY);
+
+    f = completeSkeletal();
+    f.hasBodySkin = 0;
+    CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_NO_BODY);
+
+    /* half a legacy body is not a body */
+    f = completeSkeletal();
+    f.hasBodySkin = f.hasBodyMesh = 0;
+    f.hasLowerSkin = f.hasLowerMesh = f.hasUpperMesh = 1;
+    CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_NO_BODY);
+
+    f = completeSkeletal();
+    f.hasHeadSkin = 0;
+    CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_NO_HEAD_SKIN);
+}
+
+static void test_model_pick_candidate(void)
+{
+    /* index 0 = American, 1 = Partisan */
+    CHECK(VrMerc_PickCandidate(0, VRMERC_MODEL_OK, VRMERC_MODEL_OK) == 0);
+    CHECK(VrMerc_PickCandidate(1, VRMERC_MODEL_OK, VRMERC_MODEL_OK) == 1);
+    /* the reported case: American has no animation scripts, Partisan is complete */
+    CHECK(VrMerc_PickCandidate(0, VRMERC_MODEL_NO_ANIM_CFG, VRMERC_MODEL_OK) == 1);
+    CHECK(VrMerc_PickCandidate(0, VRMERC_MODEL_NO_ANIM_SCRIPT, VRMERC_MODEL_OK) == 1);
+    CHECK(VrMerc_PickCandidate(1, VRMERC_MODEL_OK, VRMERC_MODEL_NO_BODY) == 0);
+    /* neither usable: no spawn at all, never a broken or invisible character */
+    CHECK(VrMerc_PickCandidate(0, VRMERC_MODEL_NO_ANIM_CFG, VRMERC_MODEL_NO_BODY) == -1);
+    CHECK(VrMerc_PickCandidate(1, VRMERC_MODEL_NO_ANIM_CFG, VRMERC_MODEL_NO_HEAD_SKIN) == -1);
+    /* junk setting behaves like the default */
+    CHECK(VrMerc_PickCandidate(7, VRMERC_MODEL_OK, VRMERC_MODEL_OK) == 0);
+}
+
+static void test_no_model_blocks_hire_and_auto_spawn(void)
+{
+    vrMercHireContext_t c = okContext();
+    int result;
+
+    c.modelUsable = 0;
+    result = VrMerc_CanHire(&c);
+    CHECK(result == VRMERC_HIRE_NO_MODEL);
+    CHECK(!VrMerc_ShouldAutoSpawn(1, result, 0, 10000, 0, 99999));
+}
+
 static void test_state_helpers(void)
 {
     CHECK(VrMerc_StateIsActive(VRMERC_FOLLOW));
@@ -564,6 +657,12 @@ int main(void)
     test_state_return_arrives();
     test_state_helpers();
     test_character_setting();
+
+    test_model_complete_is_ok();
+    test_model_missing_animation_files_are_rejected();
+    test_model_missing_visual_files_are_rejected();
+    test_model_pick_candidate();
+    test_no_model_blocks_hire_and_auto_spawn();
 
     test_progress_watchdog();
     test_unreachable_return_gives_up_and_cools_down();

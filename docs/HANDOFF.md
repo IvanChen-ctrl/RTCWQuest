@@ -174,13 +174,20 @@ checklist: `docs/M3_GAMEPLAY_MERCENARY.md`. **Nothing is verified on a headset.*
   a saved client the new level did not create. The wish is the cvar `vr_merc`; level change / load re-hires a new one.
 
 ### Tests (host, no SDK)
-`make -C tests/vr_input test` -> 139 checks, 0 failures (98 from M2A + 41). `make -C tests/vr_gameplay test` -> 480 checks,
+`make -C tests/vr_input test` -> 139 checks, 0 failures (98 from M2A + 41). `make -C tests/vr_gameplay test` -> 500 checks,
 0 failures. Mutation checks (12 + 3) each make a test fail. Both run in `.github/workflows/input-host-tests.yml`.
 Edited game files were syntax-checked with host gcc against the real headers (`-include stddef.h -include stdint.h
 -DGAMEDLL`); the Actions Android build is the real compile check (see the pull request for the run).
 
+### M3 hotfix (reported from the PICO 4)
+`Error: Failed to load animation scripts for model american` on hire. Traced to `G_ParseAnimationFiles` (`g_client.c`):
+needs `models/players/american/wolfanim.cfg` + `wolfanim.script`, which the owner's pk3 set evidently lacks (which file, and why,
+is unknown). Fix: `g_merc.c` probes the files read-only before spawning (American, then Partisan), refuses the hire if
+neither is complete (`VrMerc_ModelProblem` / `VrMerc_PickCandidate`, 20 new host checks). `tools/Inventory-RtcwModels.ps1` lists
+model file names in the owner's pk3s (unrun). God Mode was reported working on the same APK.
+
 ### Not done / unknown
-- Whether the American/Partisan models exist in the retail `pak0.pk3` (assumed from the source); `merc type partisan` switches.
+- Whether the Partisan model is complete on the owner's install (probed at runtime; see `merc models` / logcat).
 - Whether the notebook corner button that opens the "Private bucket list" page is reachable in VR (`visible 2`, unverified).
 - Whether the use key on the mercenary reaches the replaced activate hook (assumed from `AICast_Activate`).
 - No FPS or `gm:` measurements; method in the M3 doc (`com_speeds 1`).

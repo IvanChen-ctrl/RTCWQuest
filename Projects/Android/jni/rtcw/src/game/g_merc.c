@@ -46,6 +46,8 @@ typedef struct {
 	int order;                  // vrMercOrder_t
 	int slot;                   // entity (client) number of the companion, -1 if none
 	int character;              // AICHAR_* used for the current / pending companion
+	qboolean modelsProbed;      // model files were checked on this level
+	int modelProblem[2];        // vrMercModelProblem_t for each candidate
 	int holdGoal;               // entity number of the wait goal, -1 if none
 	vec3_t holdPos;
 	qboolean dismissRequested;
@@ -122,6 +124,7 @@ static const char *VrMerc_HireReasonText( int reason ) {
 	case VRMERC_HIRE_NO_CLIENT_SLOT:    return "Mercenary: no free character slot";
 	case VRMERC_HIRE_NO_NAVIGATION:     return "Mercenary: this map has no navigation data";
 	case VRMERC_HIRE_NO_SPAWN_POINT:    return "Mercenary: no safe spot near you";
+	case VRMERC_HIRE_NO_MODEL:          return "Mercenary: no allied soldier model found (see log)";
 	default:                            return "Mercenary: cannot hire now";
 	}
 }
@@ -147,6 +150,100 @@ static qboolean VrMerc_CameraActive( gentity_t *player ) {
 	return ( player->client->cameraPortal || ( player->client->ps.eFlags & EF_VIEWING_CAMERA ) ) ? qtrue : qfalse;
 }
 
+/*
+===============
+Model completeness probe
+
+Opens (read-only, nothing is extracted or copied) the files the engine needs for
+an allied character, using the same names and size limits as G_ParseAnimationFiles
+and the cgame model loader.  Without them ClientUserinfoChanged aborts the game
+with "Failed to load animation scripts for model <name>".
+===============
+*/
+static const int mercCandidates[2] = { AICHAR_AMERICAN, AICHAR_PARTISAN };
+
+static qboolean VrMerc_FileOk( const char *name, int maxLen ) {
+	fileHandle_t f = 0;
+	int len = trap_FS_FOpenFile( name, &f, FS_READ );
+
+	if ( f ) {
+		trap_FS_FCloseFile( f );
+	}
+	return ( len > 0 && ( maxLen <= 0 || len < maxLen ) ) ? qtrue : qfalse;
+}
+
+static const char *VrMerc_ModelProblemText( int problem ) {
+	switch ( problem ) {
+	case VRMERC_MODEL_OK:               return "ok";
+	case VRMERC_MODEL_NO_ANIM_CFG:      return "wolfanim.cfg missing";
+	case VRMERC_MODEL_NO_ANIM_SCRIPT:   return "wolfanim.script missing";
+	case VRMERC_MODEL_NO_BODY:          return "body mesh/skin files missing";
+	case VRMERC_MODEL_NO_HEAD_SKIN:     return "head skin missing";
+	default:                            return "unknown";
+	}
+}
+
+static int VrMerc_ProbeModel( int aiChar ) {
+	char skinSpec[MAX_QPATH];
+	char model[MAX_QPATH];
+	const char *skin;
+	char *slash;
+	char path[MAX_QPATH];
+	vrMercModelFiles_t f;
+	int problem;
+
+	Q_strncpyz( skinSpec, aiDefaults[aiChar].skin, sizeof( skinSpec ) );
+	slash = strchr( skinSpec, '/' );
+	if ( slash ) {
+		*slash = 0;
+		skin = slash + 1;
+	} else {
+		skin = "default";
+	}
+	Q_strncpyz( model, skinSpec, sizeof( model ) );
+
+	memset( &f, 0, sizeof( f ) );
+	#define VRMERC_PROBE( field, maxLen, ... ) \
+		Com_sprintf( path, sizeof( path ), __VA_ARGS__ ); \
+		f.field = VrMerc_FileOk( path, maxLen )
+	VRMERC_PROBE( hasAnimCfg, 100000, "models/players/%s/wolfanim.cfg", model );
+	VRMERC_PROBE( hasAnimScript, 100000, "models/players/%s/wolfanim.script", model );
+	VRMERC_PROBE( hasBodySkin, 0, "models/players/%s/body_%s.skin", model, skin );
+	VRMERC_PROBE( hasBodyMesh, 0, "models/players/%s/body.mds", model );
+	VRMERC_PROBE( hasLowerSkin, 0, "models/players/%s/lower_%s.skin", model, skin );
+	VRMERC_PROBE( hasUpperSkin, 0, "models/players/%s/upper_%s.skin", model, skin );
+	VRMERC_PROBE( hasLowerMesh, 0, "models/players/%s/lower.md3", model );
+	VRMERC_PROBE( hasUpperMesh, 0, "models/players/%s/upper.md3", model );
+	VRMERC_PROBE( hasHeadSkin, 0, "models/players/%s/head_default.skin", model );
+	#undef VRMERC_PROBE
+
+	problem = VrMerc_ModelProblem( &f );
+	G_Printf( "VR mercenary: model '%s' (%s): %s [cfg=%d script=%d bodyskin=%d bodymds=%d lower/upper=%d%d%d%d head=%d]\n",
+			  model, aiDefaults[aiChar].name, VrMerc_ModelProblemText( problem ),
+			  f.hasAnimCfg, f.hasAnimScript, f.hasBodySkin, f.hasBodyMesh,
+			  f.hasLowerSkin, f.hasUpperSkin, f.hasLowerMesh, f.hasUpperMesh, f.hasHeadSkin );
+	return problem;
+}
+
+// Probes both candidates once per level (the files cannot change while the game runs).
+static void VrMerc_ProbeModels( void ) {
+	int i;
+
+	if ( merc.modelsProbed ) {
+		return;
+	}
+	for ( i = 0; i < 2; i++ ) {
+		merc.modelProblem[i] = VrMerc_ProbeModel( mercCandidates[i] );
+	}
+	merc.modelsProbed = qtrue;
+}
+
+// Index into mercCandidates of the character to hire, or -1.
+static int VrMerc_PickModel( void ) {
+	VrMerc_ProbeModels();
+	return VrMerc_PickCandidate( vr_merc_char.integer, merc.modelProblem[0], merc.modelProblem[1] );
+}
+
 static void VrMerc_BuildHireContext( gentity_t *player, vrMercHireContext_t *c ) {
 	memset( c, 0, sizeof( *c ) );
 	c->singlePlayerGame = ( g_gametype.integer == GT_SINGLE_PLAYER );
@@ -159,6 +256,7 @@ static void VrMerc_BuildHireContext( gentity_t *player, vrMercHireContext_t *c )
 	c->spawnPending = merc.spawnPending;
 	c->freeClientSlots = aicast_maxclients - level.numPlayingClients;
 	c->navigationLoaded = trap_AAS_Initialized() ? 1 : 0;
+	c->modelUsable = ( VrMerc_PickModel() >= 0 );
 }
 
 /*
@@ -437,14 +535,20 @@ static qboolean VrMerc_FindSpawnPos( gentity_t *player, vec3_t outPos ) {
 	return qfalse;
 }
 
-static void VrMerc_RequestSpawn( gentity_t *player, vec3_t pos ) {
+static qboolean VrMerc_RequestSpawn( gentity_t *player, vec3_t pos ) {
 	gentity_t *spawn = G_Spawn();
-	int i;
+	int i, pick;
 
 	// Same fields the map loader fills for an "ai_american" entity; AIChar_spawn
 	// (stock) consumes this entity and creates the real character a few frames later.
-	spawn->classname = ( vr_merc_char.integer == 1 ) ? "ai_partisan" : "ai_american";
-	merc.character = VrMerc_CharacterForSetting( vr_merc_char.integer, AICHAR_AMERICAN, AICHAR_PARTISAN );
+	// only a character whose model and animation files exist (CanHire has checked this)
+	pick = VrMerc_PickModel();
+	if ( pick < 0 ) {
+		G_FreeEntity( spawn );
+		return qfalse;
+	}
+	merc.character = mercCandidates[pick];
+	spawn->classname = ( merc.character == AICHAR_PARTISAN ) ? "ai_partisan" : "ai_american";
 	spawn->aiCharacter = merc.character;
 	spawn->aiTeam = AITEAM_ALLIES;
 	spawn->aiName = VRMERC_AINAME;
@@ -466,6 +570,8 @@ static void VrMerc_RequestSpawn( gentity_t *player, vec3_t pos ) {
 	merc.spawnStart = level.time;
 	merc.spawnEntity = spawn->s.number;
 	merc.dismissRequested = qfalse;
+	G_Printf( "VR mercenary: spawning %s\n", aiDefaults[merc.character].name );
+	return qtrue;
 }
 
 static void VrMerc_CancelSpawn( void ) {
@@ -553,7 +659,9 @@ static int VrMerc_TryHire( gentity_t *player ) {
 	if ( !VrMerc_FindSpawnPos( player, pos ) ) {
 		return VRMERC_HIRE_NO_SPAWN_POINT;
 	}
-	VrMerc_RequestSpawn( player, pos );
+	if ( !VrMerc_RequestSpawn( player, pos ) ) {
+		return VRMERC_HIRE_NO_MODEL;
+	}
 	merc.spawnAttempts++;
 	return VRMERC_HIRE_OK;
 }
@@ -751,7 +859,7 @@ void VrMerc_Frame( void ) {
 ===============
 VrMerc_ClientCommand
 
-  merc hire | follow | hold | assist [0|1] | type [american|partisan] | dismiss | status
+  merc hire | follow | hold | assist [0|1] | type [american|partisan] | models | dismiss | status
 ===============
 */
 void VrMerc_ClientCommand( gentity_t *ent ) {
@@ -817,8 +925,17 @@ void VrMerc_ClientCommand( gentity_t *ent ) {
 			setting = VrMerc_NextCharacterSetting( vr_merc_char.integer );     // no argument: cycle
 		}
 		trap_Cvar_Set( "vr_merc_char", va( "%d", setting ) );
-		VrMerc_Message( setting == 1 ? "Mercenary type for the next hire: partisan" :
-									   "Mercenary type for the next hire: american" );
+		VrMerc_Message( setting == 1 ? "Mercenary preferred type: partisan (falls back if missing)" :
+									   "Mercenary preferred type: american (falls back if missing)" );
+	} else if ( !Q_stricmp( sub, "models" ) ) {
+		int i, pick = VrMerc_PickModel();
+
+		for ( i = 0; i < 2; i++ ) {
+			G_Printf( "VR mercenary: candidate %s: %s\n", aiDefaults[mercCandidates[i]].name,
+					  VrMerc_ModelProblemText( merc.modelProblem[i] ) );
+		}
+		VrMerc_Message( pick < 0 ? "Mercenary: no usable soldier model" :
+					   ( mercCandidates[pick] == AICHAR_PARTISAN ? "Mercenary model: partisan" : "Mercenary model: american" ) );
 	} else if ( !Q_stricmp( sub, "assist" ) ) {
 		int on;
 

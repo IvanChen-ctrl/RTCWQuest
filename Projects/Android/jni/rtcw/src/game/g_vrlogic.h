@@ -261,7 +261,8 @@ typedef enum {
 	VRMERC_HIRE_SPAWN_PENDING,
 	VRMERC_HIRE_NO_CLIENT_SLOT,
 	VRMERC_HIRE_NO_NAVIGATION,
-	VRMERC_HIRE_NO_SPAWN_POINT
+	VRMERC_HIRE_NO_SPAWN_POINT,
+	VRMERC_HIRE_NO_MODEL            /* no allied character has complete model/animation files */
 } vrMercHireResult_t;
 
 typedef struct {
@@ -275,6 +276,7 @@ typedef struct {
 	int spawnPending;       /* a spawn request is in flight                    */
 	int freeClientSlots;    /* sv_maxclients minus playing clients             */
 	int navigationLoaded;   /* AAS data present for this map                   */
+	int modelUsable;        /* an allied character with complete files exists  */
 } vrMercHireContext_t;
 
 static inline int VrMerc_CanHire( const vrMercHireContext_t *c ) {
@@ -307,6 +309,9 @@ static inline int VrMerc_CanHire( const vrMercHireContext_t *c ) {
 	}
 	if ( !c->navigationLoaded ) {
 		return VRMERC_HIRE_NO_NAVIGATION;
+	}
+	if ( !c->modelUsable ) {
+		return VRMERC_HIRE_NO_MODEL;
 	}
 	return VRMERC_HIRE_OK;
 }
@@ -345,6 +350,76 @@ static inline int VrMerc_SpawnOffset( int index, float playerYawDeg, float *dx, 
 	*dx = cosf( a ) * rings[index / 8];
 	*dy = sinf( a ) * rings[index / 8];
 	return 1;
+}
+
+/* ------------------------------------------------------------------------
+ * Character model completeness
+ *
+ * A Cast AI character is created through ClientUserinfoChanged, which calls
+ * G_ParseAnimationFiles() and aborts the whole game with
+ * "Failed to load animation scripts for model <name>" if
+ *     models/players/<model>/wolfanim.cfg      or
+ *     models/players/<model>/wolfanim.script
+ * cannot be opened.  The client additionally needs the skin files and the mesh
+ * (cg_players.c: CG_RegisterClientSkin / CG_RegisterClientModelname).  A model
+ * that is missing any of them must never be spawned: it would be fatal or
+ * invisible.  The caller opens each file read-only and fills this struct.
+ * ---------------------------------------------------------------------- */
+typedef struct {
+	int hasAnimCfg;         /* wolfanim.cfg                                   */
+	int hasAnimScript;      /* wolfanim.script                                */
+	int hasBodySkin;        /* body_<skin>.skin (skeletal)                    */
+	int hasBodyMesh;        /* body.mds                                       */
+	int hasLowerSkin;       /* lower_<skin>.skin (legacy md3 models)          */
+	int hasUpperSkin;       /* upper_<skin>.skin                              */
+	int hasLowerMesh;       /* lower.md3                                      */
+	int hasUpperMesh;       /* upper.md3                                      */
+	int hasHeadSkin;        /* head_<headskin>.skin                           */
+} vrMercModelFiles_t;
+
+typedef enum {
+	VRMERC_MODEL_OK = 0,
+	VRMERC_MODEL_NO_ANIM_CFG,
+	VRMERC_MODEL_NO_ANIM_SCRIPT,
+	VRMERC_MODEL_NO_BODY,       /* neither a complete skeletal nor a complete md3 body */
+	VRMERC_MODEL_NO_HEAD_SKIN
+} vrMercModelProblem_t;
+
+static inline int VrMerc_ModelProblem( const vrMercModelFiles_t *f ) {
+	int skeletal = f->hasBodySkin && f->hasBodyMesh;
+	int legacy = f->hasLowerSkin && f->hasUpperSkin && f->hasLowerMesh && f->hasUpperMesh;
+
+	if ( !f->hasAnimCfg ) {
+		return VRMERC_MODEL_NO_ANIM_CFG;
+	}
+	if ( !f->hasAnimScript ) {
+		return VRMERC_MODEL_NO_ANIM_SCRIPT;
+	}
+	if ( !skeletal && !legacy ) {
+		return VRMERC_MODEL_NO_BODY;
+	}
+	if ( !f->hasHeadSkin ) {
+		return VRMERC_MODEL_NO_HEAD_SKIN;
+	}
+	return VRMERC_MODEL_OK;
+}
+
+/* Choose between the two allied candidates (index 0 = American, 1 = Partisan).
+ * `preferred` is the vr_merc_char setting; the other candidate is used only if the
+ * preferred one has a problem.  Returns the candidate index, or -1 if neither works. */
+static inline int VrMerc_PickCandidate( int preferred, int problemAmerican, int problemPartisan ) {
+	int first = ( preferred == 1 ) ? 1 : 0;
+	int problem[2];
+
+	problem[0] = problemAmerican;
+	problem[1] = problemPartisan;
+	if ( problem[first] == VRMERC_MODEL_OK ) {
+		return first;
+	}
+	if ( problem[1 - first] == VRMERC_MODEL_OK ) {
+		return 1 - first;
+	}
+	return -1;
 }
 
 /* Soldier type setting (cvar vr_merc_char): 0 = American (default), 1 = Partisan.
