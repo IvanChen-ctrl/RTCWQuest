@@ -21,7 +21,7 @@ The companion is never written into savegames.  The player's wish for a
 companion lives in the cvar "vr_merc" (not archived), so after a level
 change or a load the supervisor hires a fresh one near the player.
 
-Console / VR command: merc <hire|follow|hold|assist [0|1]|type [american|partisan]|dismiss|status>
+Console / VR command: merc <hire|follow|hold|assist [0|1]|type [model|auto]|models|dismiss|status>
 
 Pure decision logic is in g_vrlogic.h and covered by tests/vr_gameplay.
 ===========================================================================
@@ -41,13 +41,30 @@ Pure decision logic is in g_vrlogic.h and covered by tests/vr_gameplay.
 #define VRMERC_AINAME       "vr_merc_1"
 #define VRMERC_WAITGOAL     "AI_wait_goal"      // classname used by the stock "stay" order
 
+// One (behaviour, visual) pairing that can be spawned.  The AI character fixes the weapons,
+// attributes and sound scripts; model + skins are the visual identity.  Faction is set
+// separately (the spawn entity's aiTeam), so a hostile-looking model is only ever a
+// visual choice.
+typedef struct {
+	int  aiChar;                    // AICHAR_*
+	char model[VRMERC_NAME_LEN];    // models/players/<model>
+	char bodySkin[VRMERC_NAME_LEN];
+	char headSkin[VRMERC_NAME_LEN];
+	int  problem;                   // vrMercModelProblem_t
+	char missing[320];              // exact missing resources (empty if complete)
+} vrMercCand_t;
+
+#define VRMERC_MAX_CAND 8
+
 typedef struct {
 	int state;                  // vrMercState_t
 	int order;                  // vrMercOrder_t
 	int slot;                   // entity (client) number of the companion, -1 if none
 	int character;              // AICHAR_* used for the current / pending companion
 	qboolean modelsProbed;      // model files were checked on this level
-	int modelProblem[2];        // vrMercModelProblem_t for each candidate
+	int numCand;                // candidates probed so far (native ones first)
+	vrMercCand_t cand[VRMERC_MAX_CAND];
+	int chosen;                 // index into cand[] used by the current / pending companion
 	int holdGoal;               // entity number of the wait goal, -1 if none
 	vec3_t holdPos;
 	qboolean dismissRequested;
@@ -124,7 +141,7 @@ static const char *VrMerc_HireReasonText( int reason ) {
 	case VRMERC_HIRE_NO_CLIENT_SLOT:    return "Mercenary: no free character slot";
 	case VRMERC_HIRE_NO_NAVIGATION:     return "Mercenary: this map has no navigation data";
 	case VRMERC_HIRE_NO_SPAWN_POINT:    return "Mercenary: no safe spot near you";
-	case VRMERC_HIRE_NO_MODEL:          return "Mercenary: no allied soldier model found (see log)";
+	case VRMERC_HIRE_NO_MODEL:          return "Mercenary: no compatible soldier model (see log, merc models)";
 	default:                            return "Mercenary: cannot hire now";
 	}
 }
@@ -152,24 +169,47 @@ static qboolean VrMerc_CameraActive( gentity_t *player ) {
 
 /*
 ===============
-Model completeness probe
+Model discovery
 
-Opens (read-only, nothing is extracted or copied) the files the engine needs for
-an allied character, using the same names and size limits as G_ParseAnimationFiles
-and the cgame model loader.  Without them ClientUserinfoChanged aborts the game
-with "Failed to load animation scripts for model <name>".
+Reads (read-only, nothing is extracted, copied or uploaded) the files the server and cgame
+loaders need for a character model, through the engine's virtual file system, so the result
+follows the real search order: base game pk3 files and any mod directory / mission pack,
+later pk3 files overriding earlier ones.  Without these files ClientUserinfoChanged aborts with
+"Failed to load animation scripts for model <name>" or the character would be invisible / in
+its bind pose.  Skin names are discovered, not assumed.
 ===============
 */
-static const int mercCandidates[2] = { AICHAR_AMERICAN, AICHAR_PARTISAN };
+// preference order of the native (behaviour + visual) pairings
+static const int mercNativeChars[] = { AICHAR_AMERICAN, AICHAR_PARTISAN, AICHAR_SOLDIER, AICHAR_ELITEGUARD };
 
-static qboolean VrMerc_FileOk( const char *name, int maxLen ) {
+#define VRMERC_TEXT_MAX 100000      // same limit as G_ParseAnimationFiles
+static char mercText[VRMERC_TEXT_MAX];
+
+// Reads a whole text file. Returns its length, or 0 if it is missing, empty or too long.
+static int VrMerc_ReadFile( const char *name ) {
+	fileHandle_t f = 0;
+	int len = trap_FS_FOpenFile( name, &f, FS_READ );
+
+	if ( len <= 0 || len >= VRMERC_TEXT_MAX - 1 ) {
+		if ( f ) {
+			trap_FS_FCloseFile( f );
+		}
+		return 0;
+	}
+	trap_FS_Read( mercText, len, f );
+	mercText[len] = 0;
+	trap_FS_FCloseFile( f );
+	return len;
+}
+
+static qboolean VrMerc_FileOk( const char *name ) {
 	fileHandle_t f = 0;
 	int len = trap_FS_FOpenFile( name, &f, FS_READ );
 
 	if ( f ) {
 		trap_FS_FCloseFile( f );
 	}
-	return ( len > 0 && ( maxLen <= 0 || len < maxLen ) ) ? qtrue : qfalse;
+	return len > 0 ? qtrue : qfalse;
 }
 
 static const char *VrMerc_ModelProblemText( int problem ) {
@@ -177,71 +217,162 @@ static const char *VrMerc_ModelProblemText( int problem ) {
 	case VRMERC_MODEL_OK:               return "ok";
 	case VRMERC_MODEL_NO_ANIM_CFG:      return "wolfanim.cfg missing";
 	case VRMERC_MODEL_NO_ANIM_SCRIPT:   return "wolfanim.script missing";
+	case VRMERC_MODEL_NO_AI_STATES:     return "animation script has no AI states";
 	case VRMERC_MODEL_NO_BODY:          return "body mesh/skin files missing";
 	case VRMERC_MODEL_NO_HEAD_SKIN:     return "head skin missing";
 	default:                            return "unknown";
 	}
 }
 
-static int VrMerc_ProbeModel( int aiChar ) {
-	char skinSpec[MAX_QPATH];
-	char model[MAX_QPATH];
-	const char *skin;
-	char *slash;
-	char path[MAX_QPATH];
-	vrMercModelFiles_t f;
-	int problem;
+// Lists the "<prefix><name>.skin" names of a model directory.
+static int VrMerc_ListSkins( const char *model, const char *prefix, char names[][VRMERC_NAME_LEN] ) {
+	static char listBuf[8192];
+	char dir[MAX_QPATH];
+	int count;
 
-	Q_strncpyz( skinSpec, aiDefaults[aiChar].skin, sizeof( skinSpec ) );
-	slash = strchr( skinSpec, '/' );
-	if ( slash ) {
-		*slash = 0;
-		skin = slash + 1;
-	} else {
-		skin = "default";
+	Com_sprintf( dir, sizeof( dir ), "models/players/%s", model );
+	count = trap_FS_GetFileList( dir, ".skin", listBuf, sizeof( listBuf ) );
+	if ( count <= 0 ) {
+		return 0;
 	}
-	Q_strncpyz( model, skinSpec, sizeof( model ) );
-
-	memset( &f, 0, sizeof( f ) );
-	#define VRMERC_PROBE( field, maxLen, ... ) \
-		Com_sprintf( path, sizeof( path ), __VA_ARGS__ ); \
-		f.field = VrMerc_FileOk( path, maxLen )
-	VRMERC_PROBE( hasAnimCfg, 100000, "models/players/%s/wolfanim.cfg", model );
-	VRMERC_PROBE( hasAnimScript, 100000, "models/players/%s/wolfanim.script", model );
-	VRMERC_PROBE( hasBodySkin, 0, "models/players/%s/body_%s.skin", model, skin );
-	VRMERC_PROBE( hasBodyMesh, 0, "models/players/%s/body.mds", model );
-	VRMERC_PROBE( hasLowerSkin, 0, "models/players/%s/lower_%s.skin", model, skin );
-	VRMERC_PROBE( hasUpperSkin, 0, "models/players/%s/upper_%s.skin", model, skin );
-	VRMERC_PROBE( hasLowerMesh, 0, "models/players/%s/lower.md3", model );
-	VRMERC_PROBE( hasUpperMesh, 0, "models/players/%s/upper.md3", model );
-	VRMERC_PROBE( hasHeadSkin, 0, "models/players/%s/head_default.skin", model );
-	#undef VRMERC_PROBE
-
-	problem = VrMerc_ModelProblem( &f );
-	G_Printf( "VR mercenary: model '%s' (%s): %s [cfg=%d script=%d bodyskin=%d bodymds=%d lower/upper=%d%d%d%d head=%d]\n",
-			  model, aiDefaults[aiChar].name, VrMerc_ModelProblemText( problem ),
-			  f.hasAnimCfg, f.hasAnimScript, f.hasBodySkin, f.hasBodyMesh,
-			  f.hasLowerSkin, f.hasUpperSkin, f.hasLowerMesh, f.hasUpperMesh, f.hasHeadSkin );
-	return problem;
+	return VrMerc_SkinNamesFromList( listBuf, count, prefix, names, VRMERC_MAX_SKINS );
 }
 
-// Probes both candidates once per level (the files cannot change while the game runs).
+// Fills c (model, skins, problem, missing list) for the given model directory.
+static void VrMerc_ProbeModelDir( vrMercCand_t *c, const char *model ) {
+	char bodyNames[VRMERC_MAX_SKINS][VRMERC_NAME_LEN];
+	char lowerNames[VRMERC_MAX_SKINS][VRMERC_NAME_LEN];
+	char upperNames[VRMERC_MAX_SKINS][VRMERC_NAME_LEN];
+	char headNames[VRMERC_MAX_SKINS][VRMERC_NAME_LEN];
+	char path[MAX_QPATH];
+	int nBody, nLower, nUpper, nHead, idx;
+	vrMercModelFiles_t f;
+
+	memset( &f, 0, sizeof( f ) );
+	Q_strncpyz( c->model, model, sizeof( c->model ) );
+	Q_strncpyz( c->bodySkin, "default", sizeof( c->bodySkin ) );
+	Q_strncpyz( c->headSkin, "default", sizeof( c->headSkin ) );
+
+	// animation config and script (the server loader's exact files and rules)
+	Com_sprintf( path, sizeof( path ), "models/players/%s/wolfanim.cfg", model );
+	if ( VrMerc_ReadFile( path ) > 0 ) {
+		f.hasAnimCfg = 1;
+		f.cfgVersion = VrMerc_CfgVersion( mercText );
+	}
+	Com_sprintf( path, sizeof( path ), "models/players/%s/wolfanim.script", model );
+	if ( VrMerc_ReadFile( path ) > 0 ) {
+		f.hasAnimScript = 1;
+		f.scriptStateMask = VrMerc_ScriptStateMask( mercText );
+	} else if ( f.hasAnimCfg && f.cfgVersion <= 1 && VrMerc_ReadFile( "models/players/default.script" ) > 0 ) {
+		f.hasDefaultScript = 1;
+		f.scriptStateMask = VrMerc_ScriptStateMask( mercText );
+	}
+
+	// skins (discovered) and meshes
+	nBody = VrMerc_ListSkins( model, "body_", bodyNames );
+	nLower = VrMerc_ListSkins( model, "lower_", lowerNames );
+	nUpper = VrMerc_ListSkins( model, "upper_", upperNames );
+	nHead = VrMerc_ListSkins( model, "head_", headNames );
+
+	idx = VrMerc_PickSkinIndex( bodyNames, nBody );
+	if ( idx >= 0 ) {
+		f.hasBodySkin = 1;
+		Q_strncpyz( c->bodySkin, bodyNames[idx], sizeof( c->bodySkin ) );
+	} else {
+		idx = VrMerc_PickCommonSkin( lowerNames, nLower, upperNames, nUpper );
+		if ( idx >= 0 ) {
+			f.hasLowerSkin = f.hasUpperSkin = 1;
+			Q_strncpyz( c->bodySkin, lowerNames[idx], sizeof( c->bodySkin ) );
+		}
+	}
+	idx = VrMerc_PickSkinIndex( headNames, nHead );
+	if ( idx >= 0 ) {
+		f.hasHeadSkin = 1;
+		Q_strncpyz( c->headSkin, headNames[idx], sizeof( c->headSkin ) );
+	}
+	Com_sprintf( path, sizeof( path ), "models/players/%s/body.mds", model );
+	f.hasBodyMesh = VrMerc_FileOk( path );
+	Com_sprintf( path, sizeof( path ), "models/players/%s/lower.md3", model );
+	f.hasLowerMesh = VrMerc_FileOk( path );
+	Com_sprintf( path, sizeof( path ), "models/players/%s/upper.md3", model );
+	f.hasUpperMesh = VrMerc_FileOk( path );
+
+	c->problem = VrMerc_ModelProblem( &f );
+	c->missing[0] = 0;
+	if ( c->problem != VRMERC_MODEL_OK ) {
+		VrMerc_DescribeMissing( model, c->bodySkin, c->headSkin, &f, c->missing, sizeof( c->missing ) );
+	}
+	G_Printf( "VR mercenary: model '%s' (%s): %s [cfg=%d v%d script=%d defscript=%d states=0x%x "
+			  "body=%d/%d lower/upper=%d%d%d%d head=%d] skins %s/%s%s%s\n",
+			  model, aiDefaults[c->aiChar].name, VrMerc_ModelProblemText( c->problem ),
+			  f.hasAnimCfg, f.cfgVersion, f.hasAnimScript, f.hasDefaultScript, f.scriptStateMask,
+			  f.hasBodySkin, f.hasBodyMesh, f.hasLowerSkin, f.hasUpperSkin, f.hasLowerMesh, f.hasUpperMesh,
+			  f.hasHeadSkin, c->bodySkin, c->headSkin,
+			  c->missing[0] ? " MISSING: " : "", c->missing );
+}
+
+// Model directory name of a native character (the part of its default skin before '/').
+static void VrMerc_NativeModelName( int aiChar, char *out, int outSize ) {
+	char *slash;
+
+	Q_strncpyz( out, aiDefaults[aiChar].skin, outSize );
+	slash = strchr( out, '/' );
+	if ( slash ) {
+		*slash = 0;
+	}
+}
+
+// Probes the native pairings once per level.
 static void VrMerc_ProbeModels( void ) {
 	int i;
 
 	if ( merc.modelsProbed ) {
 		return;
 	}
-	for ( i = 0; i < 2; i++ ) {
-		merc.modelProblem[i] = VrMerc_ProbeModel( mercCandidates[i] );
+	merc.numCand = 0;
+	for ( i = 0; i < (int)( sizeof( mercNativeChars ) / sizeof( mercNativeChars[0] ) ) && merc.numCand < VRMERC_MAX_CAND; i++ ) {
+		vrMercCand_t *c = &merc.cand[merc.numCand];
+		char model[VRMERC_NAME_LEN];
+
+		memset( c, 0, sizeof( *c ) );
+		c->aiChar = mercNativeChars[i];
+		VrMerc_NativeModelName( c->aiChar, model, sizeof( model ) );
+		VrMerc_ProbeModelDir( c, model );
+		merc.numCand++;
 	}
 	merc.modelsProbed = qtrue;
 }
 
-// Index into mercCandidates of the character to hire, or -1.
+// Index into merc.cand[] of the pairing to spawn, or -1.  A model named by the cvar
+// vr_merc_model is tried first; it may be a native model or any other directory under
+// models/players that passes the same checks (it then gets the American behaviour).
 static int VrMerc_PickModel( void ) {
+	int problems[VRMERC_MAX_CAND];
+	int i, preferred = -1;
+	char want[VRMERC_NAME_LEN];
+
 	VrMerc_ProbeModels();
-	return VrMerc_PickCandidate( vr_merc_char.integer, merc.modelProblem[0], merc.modelProblem[1] );
+
+	trap_Cvar_VariableStringBuffer( "vr_merc_model", want, sizeof( want ) );
+	if ( want[0] ) {
+		for ( i = 0; i < merc.numCand; i++ ) {
+			if ( VrMerc_StrEqNoCase( merc.cand[i].model, want ) ) {
+				preferred = i;
+			}
+		}
+		if ( preferred < 0 && merc.numCand < VRMERC_MAX_CAND ) {
+			vrMercCand_t *c = &merc.cand[merc.numCand];
+
+			memset( c, 0, sizeof( *c ) );
+			c->aiChar = AICHAR_AMERICAN;
+			VrMerc_ProbeModelDir( c, want );
+			preferred = merc.numCand++;
+		}
+	}
+	for ( i = 0; i < merc.numCand; i++ ) {
+		problems[i] = merc.cand[i].problem;
+	}
+	return VrMerc_PickFirstViable( problems, merc.numCand, preferred );
 }
 
 static void VrMerc_BuildHireContext( gentity_t *player, vrMercHireContext_t *c ) {
@@ -535,25 +666,35 @@ static qboolean VrMerc_FindSpawnPos( gentity_t *player, vec3_t outPos ) {
 	return qfalse;
 }
 
+static char mercSpawnSkin[2 * VRMERC_NAME_LEN + 2];
+static char mercSpawnHead[VRMERC_NAME_LEN];
+
 static qboolean VrMerc_RequestSpawn( gentity_t *player, vec3_t pos ) {
 	gentity_t *spawn = G_Spawn();
 	int i, pick;
 
 	// Same fields the map loader fills for an "ai_american" entity; AIChar_spawn
 	// (stock) consumes this entity and creates the real character a few frames later.
-	// only a character whose model and animation files exist (CanHire has checked this)
+	// only a pairing whose model and animation files exist (CanHire has checked this)
 	pick = VrMerc_PickModel();
 	if ( pick < 0 ) {
 		G_FreeEntity( spawn );
 		return qfalse;
 	}
-	merc.character = mercCandidates[pick];
-	spawn->classname = ( merc.character == AICHAR_PARTISAN ) ? "ai_partisan" : "ai_american";
+	merc.chosen = pick;
+	merc.character = merc.cand[pick].aiChar;
+	spawn->classname = ( merc.character == AICHAR_PARTISAN ) ? "ai_partisan" :
+					   ( merc.character == AICHAR_SOLDIER ) ? "ai_soldier" :
+					   ( merc.character == AICHAR_ELITEGUARD ) ? "ai_eliteguard" : "ai_american";
 	spawn->aiCharacter = merc.character;
 	spawn->aiTeam = AITEAM_ALLIES;
 	spawn->aiName = VRMERC_AINAME;
-	spawn->aiSkin = "";
-	spawn->aihSkin = "default";
+	// visual identity: discovered model and skins; faction stays allied (aiTeam above)
+	// (static buffers: AIChar_spawn reads them a few frames later and only one request is pending)
+	Com_sprintf( mercSpawnSkin, sizeof( mercSpawnSkin ), "%s/%s", merc.cand[pick].model, merc.cand[pick].bodySkin );
+	Q_strncpyz( mercSpawnHead, merc.cand[pick].headSkin, sizeof( mercSpawnHead ) );
+	spawn->aiSkin = mercSpawnSkin;
+	spawn->aihSkin = mercSpawnHead;
 	VectorCopy( pos, spawn->s.origin );
 	VectorCopy( pos, spawn->r.currentOrigin );
 	spawn->s.angles[YAW] = player->client->ps.viewangles[YAW];
@@ -570,7 +711,9 @@ static qboolean VrMerc_RequestSpawn( gentity_t *player, vec3_t pos ) {
 	merc.spawnStart = level.time;
 	merc.spawnEntity = spawn->s.number;
 	merc.dismissRequested = qfalse;
-	G_Printf( "VR mercenary: spawning %s\n", aiDefaults[merc.character].name );
+	G_Printf( "VR mercenary: spawning %s behaviour with model %s skin %s head %s\n",
+			  aiDefaults[merc.character].name, merc.cand[pick].model, merc.cand[pick].bodySkin,
+			  merc.cand[pick].headSkin );
 	return qtrue;
 }
 
@@ -859,7 +1002,7 @@ void VrMerc_Frame( void ) {
 ===============
 VrMerc_ClientCommand
 
-  merc hire | follow | hold | assist [0|1] | type [american|partisan] | models | dismiss | status
+  merc hire | follow | hold | assist [0|1] | type [model|auto] | models | dismiss | status
 ===============
 */
 void VrMerc_ClientCommand( gentity_t *ent ) {
@@ -914,28 +1057,71 @@ void VrMerc_ClientCommand( gentity_t *ent ) {
 		}
 		VrMerc_SetOrder( player, comp, order, qtrue );
 	} else if ( !Q_stricmp( sub, "type" ) ) {
-		int setting;
-
 		trap_Argv( 2, arg, sizeof( arg ) );
-		if ( !Q_stricmp( arg, "american" ) ) {
-			setting = 0;
-		} else if ( !Q_stricmp( arg, "partisan" ) ) {
-			setting = 1;
+		VrMerc_ProbeModels();
+		if ( arg[0] && Q_stricmp( arg, "auto" ) ) {
+			trap_Cvar_Set( "vr_merc_model", arg );      // validated at hire time; invalid ones fall back
+			VrMerc_Message( va( "Mercenary model: %s (if usable)", arg ) );
+		} else if ( arg[0] ) {
+			trap_Cvar_Set( "vr_merc_model", "" );
+			VrMerc_Message( "Mercenary model: automatic" );
 		} else {
-			setting = VrMerc_NextCharacterSetting( vr_merc_char.integer );     // no argument: cycle
-		}
-		trap_Cvar_Set( "vr_merc_char", va( "%d", setting ) );
-		VrMerc_Message( setting == 1 ? "Mercenary preferred type: partisan (falls back if missing)" :
-									   "Mercenary preferred type: american (falls back if missing)" );
-	} else if ( !Q_stricmp( sub, "models" ) ) {
-		int i, pick = VrMerc_PickModel();
+			// no argument: cycle automatic -> each usable native model -> automatic
+			char cur[VRMERC_NAME_LEN];
+			int i, curIdx = -1, nextIdx = -1;
 
-		for ( i = 0; i < 2; i++ ) {
-			G_Printf( "VR mercenary: candidate %s: %s\n", aiDefaults[mercCandidates[i]].name,
-					  VrMerc_ModelProblemText( merc.modelProblem[i] ) );
+			trap_Cvar_VariableStringBuffer( "vr_merc_model", cur, sizeof( cur ) );
+			for ( i = 0; i < merc.numCand; i++ ) {
+				if ( cur[0] && VrMerc_StrEqNoCase( merc.cand[i].model, cur ) ) {
+					curIdx = i;
+				}
+			}
+			for ( i = curIdx + 1; i < merc.numCand; i++ ) {
+				if ( merc.cand[i].problem == VRMERC_MODEL_OK ) {
+					nextIdx = i;
+					break;
+				}
+			}
+			if ( nextIdx < 0 ) {
+				trap_Cvar_Set( "vr_merc_model", "" );
+				VrMerc_Message( "Mercenary model: automatic" );
+			} else {
+				trap_Cvar_Set( "vr_merc_model", merc.cand[nextIdx].model );
+				VrMerc_Message( va( "Mercenary model: %s", merc.cand[nextIdx].model ) );
+			}
 		}
-		VrMerc_Message( pick < 0 ? "Mercenary: no usable soldier model" :
-					   ( mercCandidates[pick] == AICHAR_PARTISAN ? "Mercenary model: partisan" : "Mercenary model: american" ) );
+	} else if ( !Q_stricmp( sub, "models" ) ) {
+		// full report: native pairings, then every other model directory that would qualify
+		static char dirBuf[8192];
+		int i, n, pick = VrMerc_PickModel();
+		char *d;
+
+		for ( i = 0; i < merc.numCand; i++ ) {
+			G_Printf( "VR mercenary: candidate %d: %s/%s model %s: %s%s%s\n", i, aiDefaults[merc.cand[i].aiChar].name,
+					  merc.cand[i].model, merc.cand[i].bodySkin, VrMerc_ModelProblemText( merc.cand[i].problem ),
+					  merc.cand[i].missing[0] ? " - missing: " : "", merc.cand[i].missing );
+		}
+		n = trap_FS_GetFileList( "models/players", "/", dirBuf, sizeof( dirBuf ) );
+		for ( i = 0, d = dirBuf; i < n; i++, d += strlen( d ) + 1 ) {
+			vrMercCand_t probe;
+			int k, known = 0;
+
+			if ( !strcmp( d, "." ) || !strcmp( d, ".." ) ) {
+				continue;
+			}
+			for ( k = 0; k < merc.numCand; k++ ) {
+				if ( VrMerc_StrEqNoCase( merc.cand[k].model, d ) ) {
+					known = 1;
+				}
+			}
+			if ( !known ) {
+				memset( &probe, 0, sizeof( probe ) );
+				probe.aiChar = AICHAR_AMERICAN;
+				VrMerc_ProbeModelDir( &probe, d );
+			}
+		}
+		VrMerc_Message( pick < 0 ? "Mercenary: no usable soldier model (see log)" :
+					   va( "Mercenary model: %s", merc.cand[pick].model ) );
 	} else if ( !Q_stricmp( sub, "assist" ) ) {
 		int on;
 

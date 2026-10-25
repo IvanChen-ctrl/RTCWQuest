@@ -140,7 +140,7 @@ All of these go through the console command `merc ...` (forwarded to the game li
 | Follow me | "> Mercenary: follow me" | `merc follow` |
 | Hold position | "> Mercenary: hold position" | `merc hold` |
 | Assist in combat on/off | "> Mercenary: assist in combat on/off" | `merc assist [0\|1]` |
-| Preferred soldier type (falls back if its files are missing) | "> Mercenary: soldier type (next hire)" | `merc type [american\|partisan]`, `merc models` |
+| Model for the next hire (automatic if unset or unusable) | "> Mercenary: model (cycle, next hire)" | `merc type [<model>\|auto]`, `merc models` |
 | Dismiss | "> Dismiss the mercenary" | `merc dismiss` |
 | Status | - | `merc status` |
 | Toggle follow/hold in the world | look at the mercenary and press **use** (dominant stick click, `+activate`; assumed to reach the stock activate hook, unverified) | - |
@@ -205,55 +205,76 @@ No frame-rate numbers exist yet. **Profiling method** (needs a PICO 4):
    median of `gm:` and `all:` and note the headset's displayed FPS (`cg_drawFPS 1`).
 4. Record the numbers in the evidence table in section 6. Do not use host numbers.
 
-## 3a. Hotfix: "Failed to load animation scripts for model american" (reported from a PICO 4)
+## 3a. Hotfix 1 and 2: mercenary model compatibility ("Failed to load animation scripts", then "no allied soldier model found")
 
-**Exact error, traced in source (not guessed):** `G_Error` in `g_client.c` (`ClientUserinfoChanged`, also `G_GetModelInfo`).
-It fires when `G_ParseAnimationFiles()` returns false. That function (server side, the active path; the cgame
-`CG_ParseAnimationFiles` is `#if 0` and unused) opens, in this order:
+### Hotfix 1 (`a8d5a1a`): the fatal error
+`G_Error` in `g_client.c` fires when the server-side `G_ParseAnimationFiles()` cannot open
+`models/players/<model>/wolfanim.cfg`, or `wolfanim.script` (or, for a cfg with `version` <= 1, `models/players/default.script`).
+The cgame twin is `#if 0`. `<model>` is the part of the character's skin string before `/` (`american/default`).
+A preflight was added so the loader is never called with an incomplete model.
 
-1. `models/players/<model>/wolfanim.cfg` (must exist, < 100000 bytes)
-2. `models/players/<model>/wolfanim.script` (must exist when the cfg says version > 1; otherwise `models/players/default.script`)
+### Hotfix 2: why the preflight then rejected both American and Partisan (headset report: "NO ALLIED SOLDIER MODEL FOUND")
+**Confirmed from source** (not from the headset logs, which I do not have):
 
-`<model>` is the part of the character's skin string before `/` (`american/default` -> `american`), set by
-`AICast_AddCastToGame` into the userinfo. So the American soldier's model folder does not provide a loadable
-`wolfanim.cfg`/`wolfanim.script` in the pk3 files loaded on that headset. **Which of the two files is missing, and why
-(not in the retail pak0, a different pk3 set, or a mission-pack override), cannot be determined from the repository**
-(no game data is in it). The mercenary spawner called this path blindly with the stock default skin, which is valid
-for the *source* but not guaranteed by the *data*.
+| Question | Answer |
+|---|---|
+| What the preflight demanded | `wolfanim.cfg`, `wolfanim.script` **always**, `body_default.skin` + `body.mds` (or four legacy lower/upper files), `head_default.skin`. |
+| What the engine really demands | cfg; script **or** (cfg `version` <= 1 and `models/players/default.script`); the body skin for the skin name it is given; a head skin for the head name it is given. Skin names are not required to be `default`. |
+| Too strict? | **Yes, in two ways (my defect):** (1) the skin names were hard-coded to `default` although they are only the stock defaults of map entities; a model whose skins are named differently (mission packs, mods) was rejected although it loads; (2) the script rule ignored the legacy `default.script` path. Whether either is the reason on your install is **not known** until the log is read. |
+| Why it was not obvious | The first version printed only flags. It did not print which path was missing or which skin names exist. |
 
-**Fix (no suppression, no invisible NPC):**
-- Before any spawn the game opens (read-only) exactly the files the server and cgame loaders need, for each candidate
-  character (American, then Partisan): `wolfanim.cfg`, `wolfanim.script`, `body_default.skin` + `body.mds` (or the four
-  legacy `lower`/`upper` skin+mesh files) and `head_default.skin` (`VrMerc_ModelProblem`, host tested).
-- The preferred type (`vr_merc_char`, default American) is used only if complete; otherwise the other one; if neither is
-  complete the hire is refused with "no allied soldier model found (see log)". It never calls the loader with an
-  incomplete model, so this fatal error cannot be triggered by the mercenary.
-- The result is logged once per level (`adb logcat -s RTCW:I | grep "VR mercenary: model"`) with every file flag, and
-  `merc models` prints it again in game.
-- Partisan is the fallback because it is used by the original single-player campaign (allied team). Its completeness is
-  **verified at runtime on your install, not assumed**.
+**Not determinable without your files:** which exact resource is missing for each candidate, and whether it is expected from the base game or from a
+mod. The runtime now reports exactly that (below), and `tools/` can do the same offline.
 
-**Read-only inventory of your pk3 files (Windows):** `tools/Inventory-RtcwModels.ps1` (not run by me: no PowerShell here)
-```
-powershell -ExecutionPolicy Bypass -File .\tools\Inventory-RtcwModels.ps1 -Path D:\path\to\RTCWQuest\Main
-```
-It opens each pk3 read-only and writes only entry names for `american, partisan, civilian, bj2, infantryss` to
-`rtcw_model_inventory.txt`; nothing is extracted or uploaded. Check the file before sharing it.
+Per candidate (what the code expects; "exact missing resource" comes from the log/inventory):
 
-**What to verify on the PICO 4 after this fix**
-1. Install the new APK, start the game, load a level with `adb logcat -c; adb logcat -s RTCW:I RTCWInput:I > merc.log`.
-2. Notebook -> Private bucket list -> "Hire a mercenary". Expected: no error screen. The log shows
-   `VR mercenary: model 'american' ...: <ok or reason>` and `model 'partisan' ...`, then `VR mercenary: spawning ...`.
-3. A visible, animated soldier appears behind you (walks, not sliding in T-pose). Name in the log tells which model.
-4. If "no allied soldier model found" appears, send `merc.log` (and the inventory report); that means neither model is
-   complete in your pk3 set and a different supported character must be chosen from the inventory.
-5. Then run the full checklist in section 6 (follow, hold, fight, dismiss, save/load).
+| Character | Runtime model (from `aiDefaults` skin) | Config / script | Mesh and skins | Source expected |
+|---|---|---|---|---|
+| American (`AICHAR_AMERICAN`, Thompson) | `american` | `models/players/american/wolfanim.cfg` + `.script` | `body_<skin>.skin`+`body.mds` or `lower_/upper_`; `head_<skin>.skin` | base game or a mod; unverified |
+| Partisan (`AICHAR_PARTISAN`, Thompson) | `partisan` | same pattern | same | same |
+| Soldier (`AICHAR_SOLDIER`, MP40) | `infantryss` | same pattern | same | base game (used by retail enemies) |
+| Elite Guard (`AICHAR_ELITEGUARD`) | `eliteguard` | same pattern | same | base game (retail enemies) |
+
+### Dynamic discovery (what the code does now)
+- **Virtual file system, not paths:** every probe goes through the engine's file system (all pk3 files, `fs_game` mod folder, mission packs),
+  so search order and overrides are the engine's own (`files.c`: pk3 files in a folder sorted alphabetically with `sp_` as `zz`, later wins;
+  mod folders before base). A model split across two pk3 files (animation in one, skins in another) is complete.
+- **Skins are discovered:** `trap_FS_GetFileList("models/players/<m>", ".skin")` -> `body_*`, `lower_*`/`upper_*`, `head_*`; `default` is preferred,
+  otherwise the first one. The spawn entity gets `aiSkin = <model>/<bodySkin>` and `aihSkin = <headSkin>`.
+- **Script is checked for AI states:** the script text must define `STATE RELAXED`, `ALERT` and `COMBAT` (the AI uses `aiState`); a
+  player-style script (e.g. BJ's) that only loads would leave the AI in its bind pose, so it is rejected with that reason.
+- **Behaviour and visual are separate:** a candidate is (`AICHAR_*` behaviour: weapons, attributes, sounds) + (model/skins). Faction is the spawn
+  entity's `aiTeam = AITEAM_ALLIES`, never the model. Preference order: american, partisan, infantryss (German soldier model, allied faction),
+  eliteguard. A model that is not in that list (a mission-pack character, `bj2`, ...) is **never chosen automatically**; it can be forced with
+  `merc type <model>` and is then used with the American behaviour only if it passes every check.
+- **Hostile-looking visuals** are only reached after the allied-looking ones fail. Their targeting is team-based, so allies and the player are never
+  targets; companion damage to the player/allies is blocked and player shots do not hurt it (same code as before). Collision uses the AI's own
+  bounding box (`aiDefaults`), not the model. What cannot be verified on the host, and must be checked on the headset: that the model really
+  animates (walk/run/idle/fire) with the chosen weapon.
+- **Fail safely:** if nothing passes, the hire is refused with the exact missing resources in logcat (`VR mercenary: model ... MISSING: ...`) and
+  the message "no compatible soldier model (see log, merc models)". Nothing is spawned, no animation error is suppressed, no placeholder.
+- **Reports:** `merc models` (console, or run once from the menu "model" button then read logcat) prints every native pairing and every other
+  model directory with a verdict.
+
+### Offline inventory of your install (nothing extracted or uploaded)
+- Windows: `powershell -ExecutionPolicy Bypass -File .\tools\Inventory-RtcwModels.ps1 -Path D:\RTCW\Main, D:\RTCW\<mission pack folder>`
+- Anywhere with Python 3: `python tools/inventory_rtcw_models.py <Main> [<mod folder> ...]` (this one I ran against synthetic pk3 files: precedence,
+  cross-pk3 merging, mod override and the AI-state check behave as described; the PowerShell script is a port that I could not execute).
+- The report lists every model folder with COMPLETE/INCOMPLETE, the exact missing paths and which pk3 provides each file.
+
+### What to verify on the PICO 4
+1. Install the APK, `adb logcat -c; adb logcat -s RTCW:I RTCWInput:I RTCWLifecycle:I > run.log`, start a level, notebook -> cheats page ->
+   "Mercenary: model" (cycles) / "Hire a mercenary".
+2. Expect in `run.log`: one `VR mercenary: model '<m>' (...)` line per candidate with `MISSING:` details, then `spawning ... with model ... skin ... head ...`.
+3. A visible, animated soldier appears behind you. Walk, stop, hold, follow, fire at an enemy: animations must play (no T-pose/sliding).
+4. If it still says "no compatible soldier model", send `run.log` and the inventory report: the exact missing paths decide the next step.
+5. Run `merc models` once and send the log as well (shows non-native model folders that qualify).
 
 ## 4. Tests
 
 ```
 make -C tests/vr_input test       # 139 checks (98 existing + 41 new for jump/diagnostics)
-make -C tests/vr_gameplay test    # 500 checks: God Mode, hire rules, spawn candidates, friend/foe, state machine,
+make -C tests/vr_gameplay test    # 544 checks: God Mode, hire rules, spawn candidates, friend/foe, state machine,
                                   #             stall watchdog, auto re-hire policy
 ```
 Both also run in `.github/workflows/input-host-tests.yml` (pull requests touching the files).
@@ -272,8 +293,8 @@ build is the compile check.
 ## 5. Known unsupported / unverified
 
 - No hardware evidence for any feature.
-- The American model has been **reported failing to load** on the owner's headset (section 3a). The game now checks the
-  model files before spawning and falls back to Partisan; neither is assumed to exist.
+- On the owner's headset the American model failed to load and then both candidates failed the first preflight (section 3a). The
+  game now discovers the files and skins it can use; if nothing qualifies it refuses and prints the exact missing paths.
 - One companion only (`VRMERC_MAX_COMPANIONS`); multiplayer and LAN co-op are out of scope.
 - Companion state is not persisted (3.5). A savegame made with a companion loads without one, then a new one is hired.
 - No voice or gesture commands; no equipment/economy; no recovery teleport.

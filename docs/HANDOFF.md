@@ -174,17 +174,19 @@ checklist: `docs/M3_GAMEPLAY_MERCENARY.md`. **Nothing is verified on a headset.*
   a saved client the new level did not create. The wish is the cvar `vr_merc`; level change / load re-hires a new one.
 
 ### Tests (host, no SDK)
-`make -C tests/vr_input test` -> 139 checks, 0 failures (98 from M2A + 41). `make -C tests/vr_gameplay test` -> 500 checks,
+`make -C tests/vr_input test` -> 139 checks, 0 failures (98 from M2A + 41). `make -C tests/vr_gameplay test` -> 544 checks,
 0 failures. Mutation checks (12 + 3) each make a test fail. Both run in `.github/workflows/input-host-tests.yml`.
 Edited game files were syntax-checked with host gcc against the real headers (`-include stddef.h -include stdint.h
 -DGAMEDLL`); the Actions Android build is the real compile check (see the pull request for the run).
 
-### M3 hotfix (reported from the PICO 4)
-`Error: Failed to load animation scripts for model american` on hire. Traced to `G_ParseAnimationFiles` (`g_client.c`):
-needs `models/players/american/wolfanim.cfg` + `wolfanim.script`, which the owner's pk3 set evidently lacks (which file, and why,
-is unknown). Fix: `g_merc.c` probes the files read-only before spawning (American, then Partisan), refuses the hire if
-neither is complete (`VrMerc_ModelProblem` / `VrMerc_PickCandidate`, 20 new host checks). `tools/Inventory-RtcwModels.ps1` lists
-model file names in the owner's pk3s (unrun). God Mode was reported working on the same APK.
+### M3 hotfixes (reported from the PICO 4)
+1. `Failed to load animation scripts for model american` (fatal) -> preflight before spawn (`a8d5a1a`).
+2. `NO ALLIED SOLDIER MODEL FOUND` (both American and Partisan rejected). Root cause not determinable without the owner's files; found in
+   source that my preflight was stricter than the loader (hard-coded `default` skin names, ignored the `default.script` rule). Now: skin names
+   discovered via `trap_FS_GetFileList`, script rule = the loader's, script must define AI states, candidates are (behaviour, visual) pairs
+   (american, partisan, infantryss, eliteguard; others only via `merc type <model>`), exact missing paths logged (`VR mercenary: model ...
+   MISSING: ...`), `merc models` full report, refusal if nothing qualifies. Offline: `tools/inventory_rtcw_models.py` (tested on synthetic pk3)
+   and `tools/Inventory-RtcwModels.ps1` (port, **not executed**). Tests: `tests/vr_gameplay` 544 checks.
 
 ### Not done / unknown
 - Whether the Partisan model is complete on the owner's install (probed at runtime; see `merc models` / logcat).

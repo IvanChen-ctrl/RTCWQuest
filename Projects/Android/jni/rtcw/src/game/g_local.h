@@ -1096,7 +1096,7 @@ extern vmCvar_t g_reloading;        //----(SA)	added
 extern vmCvar_t vr_godmode;
 extern vmCvar_t vr_merc;
 extern vmCvar_t vr_merc_assist;
-extern vmCvar_t vr_merc_char;
+extern vmCvar_t vr_merc_model;
 qboolean G_VrGodProtects( gentity_t *targ, int dflags );
 void     G_VrGodModeChanged( void );
 void     VrMerc_Init( void );

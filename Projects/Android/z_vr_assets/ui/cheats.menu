@@ -228,7 +228,7 @@ itemDef {
   rect 64 375 240 20
   type ITEM_TYPE_BUTTON
   style WINDOW_STYLE_EMPTY
-  text "> Mercenary: soldier type (next hire)"
+  text "> Mercenary: model (cycle, next hire)"
   textfont UI_FONT_HANDWRITING
   textscale .3
   textaligny 15

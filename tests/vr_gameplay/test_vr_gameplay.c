@@ -515,26 +515,19 @@ static void test_session_reset_after_load_has_no_duplicates(void)
     CHECK(spawns == 1);
 }
 
-static void test_character_setting(void)
-{
-    /* arbitrary stand-in numbers for AICHAR_AMERICAN / AICHAR_PARTISAN */
-    CHECK(VrMerc_CharacterForSetting(0, 2, 19) == 2);
-    CHECK(VrMerc_CharacterForSetting(1, 2, 19) == 19);
-    CHECK(VrMerc_CharacterForSetting(-5, 2, 19) == 2);      /* junk falls back to the default */
-    CHECK(VrMerc_CharacterForSetting(7, 2, 19) == 2);
-    CHECK(VrMerc_NextCharacterSetting(0) == 1);
-    CHECK(VrMerc_NextCharacterSetting(1) == 0);
-    CHECK(VrMerc_NextCharacterSetting(9) == 1);
-}
-
-/* ===================== model completeness (regression: fatal "Failed to load animation scripts") ===================== */
+/* ===================== model discovery and completeness ===================== */
+/* Regression: "Failed to load animation scripts for model american" and the follow-up
+ * "no allied soldier model found". The engine reads these files through its virtual file system
+ * (all pk3 files + mod directories); the logic below decides from what was found. */
 
 static vrMercModelFiles_t completeSkeletal(void)
 {
     vrMercModelFiles_t f;
     memset(&f, 0, sizeof(f));
     f.hasAnimCfg = 1;
+    f.cfgVersion = 2;
     f.hasAnimScript = 1;
+    f.scriptStateMask = VRMERC_STATE_RELAXED | VRMERC_STATE_QUERY | VRMERC_STATE_ALERT | VRMERC_STATE_COMBAT;
     f.hasBodySkin = 1;
     f.hasBodyMesh = 1;
     f.hasHeadSkin = 1;
@@ -547,36 +540,70 @@ static void test_model_complete_is_ok(void)
     CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_OK);
 
     /* legacy md3 character: lower/upper parts instead of a skeletal body */
-    memset(&f, 0, sizeof(f));
-    f.hasAnimCfg = f.hasAnimScript = f.hasHeadSkin = 1;
+    f = completeSkeletal();
+    f.hasBodySkin = f.hasBodyMesh = 0;
     f.hasLowerSkin = f.hasUpperSkin = f.hasLowerMesh = f.hasUpperMesh = 1;
+    CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_OK);
+
+    /* QUERY is optional for a fighter */
+    f = completeSkeletal();
+    f.scriptStateMask = VRMERC_STATES_REQUIRED;
     CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_OK);
 }
 
 static void test_model_missing_animation_files_are_rejected(void)
 {
-    /* The exact headset failure: the server cannot open wolfanim.cfg / wolfanim.script. */
+    /* The reported fatal error: the server cannot open wolfanim.cfg / wolfanim.script. */
     vrMercModelFiles_t f = completeSkeletal();
     f.hasAnimCfg = 0;
     CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_NO_ANIM_CFG);
 
     f = completeSkeletal();
-    f.hasAnimScript = 0;
+    f.hasAnimScript = 0;                                    /* version 2 cfg: no fallback script allowed */
     CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_NO_ANIM_SCRIPT);
 
-    /* nothing at all */
     memset(&f, 0, sizeof(f));
     CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_NO_ANIM_CFG);
 }
 
-static void test_model_missing_visual_files_are_rejected(void)
+static void test_model_legacy_default_script_rule(void)
+{
+    /* The loader falls back to models/players/default.script only for cfg version <= 1. */
+    vrMercModelFiles_t f = completeSkeletal();
+    f.hasAnimScript = 0;
+    f.hasDefaultScript = 1;
+    f.cfgVersion = 1;
+    CHECK(VrMerc_AnimScriptAvailable(&f));
+    CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_OK);
+
+    f.cfgVersion = 0;                                       /* no "version" token at all */
+    CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_OK);
+
+    f.cfgVersion = 2;                                       /* v2 needs its own script */
+    CHECK(!VrMerc_AnimScriptAvailable(&f));
+    CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_NO_ANIM_SCRIPT);
+}
+
+static void test_model_script_must_have_ai_states(void)
+{
+    /* e.g. a player-style script: files load, but the AI would stay in its bind pose */
+    vrMercModelFiles_t f = completeSkeletal();
+    f.scriptStateMask = VRMERC_STATE_RELAXED;
+    CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_NO_AI_STATES);
+    f.scriptStateMask = VRMERC_STATE_RELAXED | VRMERC_STATE_ALERT;      /* no COMBAT: cannot fight */
+    CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_NO_AI_STATES);
+    f.scriptStateMask = 0;
+    CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_NO_AI_STATES);
+}
+
+static void test_model_invalid_skin_combinations(void)
 {
     vrMercModelFiles_t f = completeSkeletal();
     f.hasBodyMesh = 0;                                      /* skin without mesh: invisible character */
     CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_NO_BODY);
 
     f = completeSkeletal();
-    f.hasBodySkin = 0;
+    f.hasBodySkin = 0;                                      /* mesh without skin */
     CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_NO_BODY);
 
     /* half a legacy body is not a body */
@@ -590,20 +617,46 @@ static void test_model_missing_visual_files_are_rejected(void)
     CHECK(VrMerc_ModelProblem(&f) == VRMERC_MODEL_NO_HEAD_SKIN);
 }
 
-static void test_model_pick_candidate(void)
+static void test_model_files_merged_across_pk3_sources(void)
 {
-    /* index 0 = American, 1 = Partisan */
-    CHECK(VrMerc_PickCandidate(0, VRMERC_MODEL_OK, VRMERC_MODEL_OK) == 0);
-    CHECK(VrMerc_PickCandidate(1, VRMERC_MODEL_OK, VRMERC_MODEL_OK) == 1);
-    /* the reported case: American has no animation scripts, Partisan is complete */
-    CHECK(VrMerc_PickCandidate(0, VRMERC_MODEL_NO_ANIM_CFG, VRMERC_MODEL_OK) == 1);
-    CHECK(VrMerc_PickCandidate(0, VRMERC_MODEL_NO_ANIM_SCRIPT, VRMERC_MODEL_OK) == 1);
-    CHECK(VrMerc_PickCandidate(1, VRMERC_MODEL_OK, VRMERC_MODEL_NO_BODY) == 0);
-    /* neither usable: no spawn at all, never a broken or invisible character */
-    CHECK(VrMerc_PickCandidate(0, VRMERC_MODEL_NO_ANIM_CFG, VRMERC_MODEL_NO_BODY) == -1);
-    CHECK(VrMerc_PickCandidate(1, VRMERC_MODEL_NO_ANIM_CFG, VRMERC_MODEL_NO_HEAD_SKIN) == -1);
-    /* junk setting behaves like the default */
-    CHECK(VrMerc_PickCandidate(7, VRMERC_MODEL_OK, VRMERC_MODEL_OK) == 0);
+    /* The engine's file system presents the union of base pk3 files and mod/mission-pack pk3
+     * files (later ones override). A model whose animation files are in one pk3 and whose
+     * skins come from another is complete; a model split so that something is in no pk3 is not. */
+    vrMercModelFiles_t base, mod, merged;
+    memset(&base, 0, sizeof(base));
+    memset(&mod, 0, sizeof(mod));
+
+    base.hasAnimCfg = 1; base.cfgVersion = 2; base.hasAnimScript = 1;
+    base.scriptStateMask = VRMERC_STATES_REQUIRED;
+    base.hasBodyMesh = 1;                                   /* base game: no skins for this model */
+    CHECK(VrMerc_ModelProblem(&base) != VRMERC_MODEL_OK);
+
+    mod.hasBodySkin = 1; mod.hasHeadSkin = 1;               /* mission pack adds the skins */
+    merged = base;
+    merged.hasBodySkin |= mod.hasBodySkin;
+    merged.hasHeadSkin |= mod.hasHeadSkin;
+    CHECK(VrMerc_ModelProblem(&merged) == VRMERC_MODEL_OK);
+
+    merged = base;                                          /* mod adds only a head */
+    merged.hasHeadSkin |= mod.hasHeadSkin;
+    CHECK(VrMerc_ModelProblem(&merged) == VRMERC_MODEL_NO_BODY);
+}
+
+static void test_pick_first_viable(void)
+{
+    int p[4];
+
+    p[0] = VRMERC_MODEL_NO_ANIM_CFG; p[1] = VRMERC_MODEL_OK; p[2] = VRMERC_MODEL_OK; p[3] = VRMERC_MODEL_NO_BODY;
+    CHECK(VrMerc_PickFirstViable(p, 4, -1) == 1);           /* first usable in preference order */
+    CHECK(VrMerc_PickFirstViable(p, 4, 2) == 2);            /* explicit choice wins when usable */
+    CHECK(VrMerc_PickFirstViable(p, 4, 3) == 1);            /* unusable choice falls back, never used */
+    CHECK(VrMerc_PickFirstViable(p, 4, 0) == 1);
+    CHECK(VrMerc_PickFirstViable(p, 4, 99) == 1);           /* out of range ignored */
+    CHECK(VrMerc_PickFirstViable(p, 4, -5) == 1);
+
+    p[1] = VRMERC_MODEL_NO_ANIM_SCRIPT; p[2] = VRMERC_MODEL_NO_AI_STATES;
+    CHECK(VrMerc_PickFirstViable(p, 4, -1) == -1);          /* nothing usable: no spawn at all */
+    CHECK(VrMerc_PickFirstViable(p, 0, -1) == -1);
 }
 
 static void test_no_model_blocks_hire_and_auto_spawn(void)
@@ -615,6 +668,125 @@ static void test_no_model_blocks_hire_and_auto_spawn(void)
     result = VrMerc_CanHire(&c);
     CHECK(result == VRMERC_HIRE_NO_MODEL);
     CHECK(!VrMerc_ShouldAutoSpawn(1, result, 0, 10000, 0, 99999));
+}
+
+static void test_skin_discovery_from_file_list(void)
+{
+    /* what trap_FS_GetFileList returns: consecutive NUL-terminated names */
+    static const char list[] =
+        "body_default.skin\0body_blue.skin\0head_default.skin\0lower_x.skin\0body_notes.skin.bak\0"
+        "BODY_Red.SKIN\0body_.skin\0wolfanim.cfg";
+    char names[VRMERC_MAX_SKINS][VRMERC_NAME_LEN];
+    int n;
+
+    n = VrMerc_SkinNamesFromList(list, 8, "body_", names, VRMERC_MAX_SKINS);
+    CHECK(n == 3);                                          /* default, blue, Red (any case); not .bak, not empty */
+    CHECK(strcmp(names[0], "default") == 0);
+    CHECK(strcmp(names[1], "blue") == 0);
+    CHECK(strcmp(names[2], "Red") == 0);
+    CHECK(VrMerc_PickSkinIndex(names, n) == 0);
+
+    n = VrMerc_SkinNamesFromList(list, 8, "head_", names, VRMERC_MAX_SKINS);
+    CHECK(n == 1 && strcmp(names[0], "default") == 0);
+
+    n = VrMerc_SkinNamesFromList(list, 8, "upper_", names, VRMERC_MAX_SKINS);
+    CHECK(n == 0);
+    CHECK(VrMerc_PickSkinIndex(names, n) == -1);
+
+    n = VrMerc_SkinNamesFromList(list, 8, "body_", names, 2);   /* output limit respected */
+    CHECK(n == 2);
+}
+
+static void test_skin_not_named_default(void)
+{
+    /* models whose skins are not called "default" (mission packs) are still found */
+    static const char list[] = "body_trooper.skin\0body_officer.skin\0head_trooper.skin";
+    char body[VRMERC_MAX_SKINS][VRMERC_NAME_LEN];
+    char head[VRMERC_MAX_SKINS][VRMERC_NAME_LEN];
+    int nb = VrMerc_SkinNamesFromList(list, 3, "body_", body, VRMERC_MAX_SKINS);
+    int nh = VrMerc_SkinNamesFromList(list, 3, "head_", head, VRMERC_MAX_SKINS);
+
+    CHECK(nb == 2 && nh == 1);
+    CHECK(VrMerc_PickSkinIndex(body, nb) == 0);
+    CHECK(strcmp(head[VrMerc_PickSkinIndex(head, nh)], "trooper") == 0);
+}
+
+static void test_legacy_common_skin(void)
+{
+    char lower[VRMERC_MAX_SKINS][VRMERC_NAME_LEN] = { "red", "default" };
+    char upper[VRMERC_MAX_SKINS][VRMERC_NAME_LEN] = { "default", "blue" };
+    char upperOther[VRMERC_MAX_SKINS][VRMERC_NAME_LEN] = { "green" };
+
+    CHECK(VrMerc_PickCommonSkin(lower, 2, upper, 2) == 1);         /* default preferred */
+    CHECK(VrMerc_PickCommonSkin(lower, 1, upperOther, 1) == -1);   /* lower and upper must share a skin */
+    CHECK(VrMerc_PickCommonSkin(lower, 0, upper, 2) == -1);
+    {
+        char l2[VRMERC_MAX_SKINS][VRMERC_NAME_LEN] = { "a", "b" };
+        char u2[VRMERC_MAX_SKINS][VRMERC_NAME_LEN] = { "b" };
+        CHECK(VrMerc_PickCommonSkin(l2, 2, u2, 1) == 1);           /* otherwise the first common one */
+    }
+}
+
+static void test_cfg_version_parse(void)
+{
+    CHECK(VrMerc_CfgVersion("version 2\nskeletal\n") == 2);
+    CHECK(VrMerc_CfgVersion("// comment\nfootsteps boot\nVERSION 1\n") == 1);
+    CHECK(VrMerc_CfgVersion("/* version 9 */ version 2") == 2);                   /* comments ignored */
+    CHECK(VrMerc_CfgVersion("// version 9\nfootsteps boot") == 0);
+    CHECK(VrMerc_CfgVersion("") == 0);
+    CHECK(VrMerc_CfgVersion("version") == 0);
+    CHECK(VrMerc_CfgVersion("sex male\nversion   3  \n") == 3);
+}
+
+static void test_script_state_mask(void)
+{
+    const char *full =
+        "// animations\nSTATE RELAXED { WALK { } }\nstate query\n{ }\nState ALERT {}\nSTATE COMBAT\n{\n}\n";
+    const char *playerStyle = "STATE RELAXED\n{\n}\n";
+    const char *commented = "// STATE COMBAT\n/* STATE ALERT */\nSTATE RELAXED { }";
+    const char *wordOnly = "WALK { animation combat 0 12 }";                          /* not a STATE block */
+
+    CHECK(VrMerc_ScriptStateMask(full) == (VRMERC_STATE_RELAXED | VRMERC_STATE_QUERY | VRMERC_STATE_ALERT | VRMERC_STATE_COMBAT));
+    CHECK(VrMerc_ScriptStateMask(playerStyle) == VRMERC_STATE_RELAXED);
+    CHECK(VrMerc_ScriptStateMask(commented) == VRMERC_STATE_RELAXED);
+    CHECK(VrMerc_ScriptStateMask(wordOnly) == 0);
+    CHECK(VrMerc_ScriptStateMask("") == 0);
+}
+
+static void test_missing_resource_report(void)
+{
+    char out[512];
+    vrMercModelFiles_t f;
+    int n;
+
+    memset(&f, 0, sizeof(f));
+    f.cfgVersion = 2;
+    n = VrMerc_DescribeMissing("american", "default", "default", &f, out, sizeof(out));
+    CHECK(n == 5);
+    CHECK(strstr(out, "models/players/american/wolfanim.cfg"));
+    CHECK(strstr(out, "models/players/american/wolfanim.script"));
+    CHECK(strstr(out, "models/players/american/body_default.skin"));
+    CHECK(strstr(out, "models/players/american/body.mds"));
+    CHECK(strstr(out, "models/players/american/head_default.skin"));
+
+    f = completeSkeletal();
+    CHECK(VrMerc_DescribeMissing("partisan", "default", "default", &f, out, sizeof(out)) == 0);
+    CHECK(out[0] == 0);
+
+    f = completeSkeletal();
+    f.hasHeadSkin = 0;
+    n = VrMerc_DescribeMissing("partisan", "default", "trooper", &f, out, sizeof(out));
+    CHECK(n == 1 && strcmp(out, "models/players/partisan/head_trooper.skin") == 0);
+
+    f = completeSkeletal();
+    f.scriptStateMask = VRMERC_STATE_RELAXED;
+    n = VrMerc_DescribeMissing("bj2", "default", "default", &f, out, sizeof(out));
+    CHECK(n == 1 && strstr(out, "AI states"));
+
+    /* tiny buffers never overflow */
+    memset(&f, 0, sizeof(f));
+    n = VrMerc_DescribeMissing("american", "default", "default", &f, out, 20);
+    CHECK(strlen(out) < 20);
 }
 
 static void test_state_helpers(void)
@@ -656,13 +828,21 @@ int main(void)
     test_state_hold_orders();
     test_state_return_arrives();
     test_state_helpers();
-    test_character_setting();
 
     test_model_complete_is_ok();
     test_model_missing_animation_files_are_rejected();
-    test_model_missing_visual_files_are_rejected();
-    test_model_pick_candidate();
+    test_model_legacy_default_script_rule();
+    test_model_script_must_have_ai_states();
+    test_model_invalid_skin_combinations();
+    test_model_files_merged_across_pk3_sources();
+    test_pick_first_viable();
     test_no_model_blocks_hire_and_auto_spawn();
+    test_skin_discovery_from_file_list();
+    test_skin_not_named_default();
+    test_legacy_common_skin();
+    test_cfg_version_parse();
+    test_script_state_mask();
+    test_missing_resource_report();
 
     test_progress_watchdog();
     test_unreachable_return_gives_up_and_cools_down();

@@ -353,21 +353,40 @@ static inline int VrMerc_SpawnOffset( int index, float playerYawDeg, float *dx, 
 }
 
 /* ------------------------------------------------------------------------
- * Character model completeness
+ * Character model discovery and completeness
  *
  * A Cast AI character is created through ClientUserinfoChanged, which calls
  * G_ParseAnimationFiles() and aborts the whole game with
- * "Failed to load animation scripts for model <name>" if
- *     models/players/<model>/wolfanim.cfg      or
- *     models/players/<model>/wolfanim.script
- * cannot be opened.  The client additionally needs the skin files and the mesh
- * (cg_players.c: CG_RegisterClientSkin / CG_RegisterClientModelname).  A model
- * that is missing any of them must never be spawned: it would be fatal or
- * invisible.  The caller opens each file read-only and fills this struct.
+ * "Failed to load animation scripts for model <name>" unless
+ *     models/players/<model>/wolfanim.cfg                         can be opened and
+ *     models/players/<model>/wolfanim.script                      can be opened, or
+ *     (the cfg declares "version" <= 1 and) models/players/default.script exists.
+ * The client additionally needs the body skin and mesh and a head skin
+ * (cg_players.c: CG_RegisterClientSkin / CG_RegisterClientModelname), and the AI
+ * needs an animation script that has the AI states (RELAXED/ALERT/COMBAT), or the
+ * character would stand in its bind pose.  Skin names are NOT assumed: they are
+ * discovered from the virtual file system (all pk3 files and mod directories, with
+ * the engine's own search order) and the first usable one is used.
+ *
+ * Nothing here touches the file system; the caller reads the files and fills the
+ * struct so the same code runs on the host in tests/vr_gameplay.
  * ---------------------------------------------------------------------- */
+#define VRMERC_NAME_LEN     64
+#define VRMERC_MAX_SKINS    16
+
+/* Bits of the animation-script state mask (STATE <name> { ... } blocks). */
+#define VRMERC_STATE_RELAXED    1
+#define VRMERC_STATE_QUERY      2
+#define VRMERC_STATE_ALERT      4
+#define VRMERC_STATE_COMBAT     8
+#define VRMERC_STATES_REQUIRED  ( VRMERC_STATE_RELAXED | VRMERC_STATE_ALERT | VRMERC_STATE_COMBAT )
+
 typedef struct {
 	int hasAnimCfg;         /* wolfanim.cfg                                   */
+	int cfgVersion;         /* "version" value declared by the cfg (0 if none) */
 	int hasAnimScript;      /* wolfanim.script                                */
+	int hasDefaultScript;   /* models/players/default.script (legacy models)  */
+	int scriptStateMask;    /* VRMERC_STATE_* found in the script that will be used */
 	int hasBodySkin;        /* body_<skin>.skin (skeletal)                    */
 	int hasBodyMesh;        /* body.mds                                       */
 	int hasLowerSkin;       /* lower_<skin>.skin (legacy md3 models)          */
@@ -381,9 +400,18 @@ typedef enum {
 	VRMERC_MODEL_OK = 0,
 	VRMERC_MODEL_NO_ANIM_CFG,
 	VRMERC_MODEL_NO_ANIM_SCRIPT,
+	VRMERC_MODEL_NO_AI_STATES,  /* script exists but has no RELAXED/ALERT/COMBAT AI states */
 	VRMERC_MODEL_NO_BODY,       /* neither a complete skeletal nor a complete md3 body */
 	VRMERC_MODEL_NO_HEAD_SKIN
 } vrMercModelProblem_t;
+
+/* The loader's own rule for the animation script (g_client.c G_ParseAnimationFiles). */
+static inline int VrMerc_AnimScriptAvailable( const vrMercModelFiles_t *f ) {
+	if ( f->hasAnimScript ) {
+		return 1;
+	}
+	return ( f->cfgVersion <= 1 && f->hasDefaultScript ) ? 1 : 0;
+}
 
 static inline int VrMerc_ModelProblem( const vrMercModelFiles_t *f ) {
 	int skeletal = f->hasBodySkin && f->hasBodyMesh;
@@ -392,8 +420,11 @@ static inline int VrMerc_ModelProblem( const vrMercModelFiles_t *f ) {
 	if ( !f->hasAnimCfg ) {
 		return VRMERC_MODEL_NO_ANIM_CFG;
 	}
-	if ( !f->hasAnimScript ) {
+	if ( !VrMerc_AnimScriptAvailable( f ) ) {
 		return VRMERC_MODEL_NO_ANIM_SCRIPT;
+	}
+	if ( ( f->scriptStateMask & VRMERC_STATES_REQUIRED ) != VRMERC_STATES_REQUIRED ) {
+		return VRMERC_MODEL_NO_AI_STATES;
 	}
 	if ( !skeletal && !legacy ) {
 		return VRMERC_MODEL_NO_BODY;
@@ -404,33 +435,254 @@ static inline int VrMerc_ModelProblem( const vrMercModelFiles_t *f ) {
 	return VRMERC_MODEL_OK;
 }
 
-/* Choose between the two allied candidates (index 0 = American, 1 = Partisan).
- * `preferred` is the vr_merc_char setting; the other candidate is used only if the
- * preferred one has a problem.  Returns the candidate index, or -1 if neither works. */
-static inline int VrMerc_PickCandidate( int preferred, int problemAmerican, int problemPartisan ) {
-	int first = ( preferred == 1 ) ? 1 : 0;
-	int problem[2];
+/* Candidate selection.  problems[i] is VrMerc_ModelProblem() of candidate i, in
+ * preference order.  `preferred` (or -1) is tried first, then the rest in order.
+ * Returns the chosen index or -1 if no candidate is usable. */
+static inline int VrMerc_PickFirstViable( const int *problems, int count, int preferred ) {
+	int i;
 
-	problem[0] = problemAmerican;
-	problem[1] = problemPartisan;
-	if ( problem[first] == VRMERC_MODEL_OK ) {
-		return first;
+	if ( preferred >= 0 && preferred < count && problems[preferred] == VRMERC_MODEL_OK ) {
+		return preferred;
 	}
-	if ( problem[1 - first] == VRMERC_MODEL_OK ) {
-		return 1 - first;
+	for ( i = 0; i < count; i++ ) {
+		if ( problems[i] == VRMERC_MODEL_OK ) {
+			return i;
+		}
 	}
 	return -1;
 }
 
-/* Soldier type setting (cvar vr_merc_char): 0 = American (default), 1 = Partisan.
- * Both are allied Cast AI characters with a Thompson; the second one exists as a
- * fallback if the American player model is missing from a particular install. */
-static inline int VrMerc_CharacterForSetting( int setting, int americanChar, int partisanChar ) {
-	return ( setting == 1 ) ? partisanChar : americanChar;
+/* ---- tiny case-insensitive helpers (no libc locale dependence) ---- */
+static inline int VrMerc_Lower( int c ) {
+	return ( c >= 'A' && c <= 'Z' ) ? c + 32 : c;
 }
 
-static inline int VrMerc_NextCharacterSetting( int setting ) {
-	return ( setting == 1 ) ? 0 : 1;
+static inline int VrMerc_StrEqNoCase( const char *a, const char *b ) {
+	while ( *a && *b ) {
+		if ( VrMerc_Lower( (unsigned char)*a ) != VrMerc_Lower( (unsigned char)*b ) ) {
+			return 0;
+		}
+		a++;
+		b++;
+	}
+	return *a == *b;
+}
+
+/* ---- skin discovery -------------------------------------------------------
+ * `list` is what trap_FS_GetFileList returns: `count` consecutive NUL-terminated
+ * names ("body_default.skin", ...).  Extracts <name> from <prefix><name>.skin. */
+static inline int VrMerc_SkinNamesFromList( const char *list, int count, const char *prefix,
+											char names[][VRMERC_NAME_LEN], int maxNames ) {
+	int found = 0, i, plen = 0;
+
+	while ( prefix[plen] ) {
+		plen++;
+	}
+	for ( i = 0; i < count && found < maxNames; i++ ) {
+		int len = 0, k;
+
+		while ( list[len] ) {
+			len++;
+		}
+		if ( len > plen + 5 && len - plen - 5 < VRMERC_NAME_LEN ) {
+			int match = 1;
+
+			for ( k = 0; k < plen && match; k++ ) {
+				if ( VrMerc_Lower( (unsigned char)list[k] ) != VrMerc_Lower( (unsigned char)prefix[k] ) ) {
+					match = 0;
+				}
+			}
+			if ( match && VrMerc_StrEqNoCase( list + len - 5, ".skin" ) ) {
+				int n = len - plen - 5;
+
+				for ( k = 0; k < n; k++ ) {
+					names[found][k] = list[plen + k];
+				}
+				names[found][n] = 0;
+				found++;
+			}
+		}
+		list += len + 1;
+	}
+	return found;
+}
+
+/* Index of "default" if present, otherwise 0; -1 for an empty list. */
+static inline int VrMerc_PickSkinIndex( char names[][VRMERC_NAME_LEN], int count ) {
+	int i;
+
+	for ( i = 0; i < count; i++ ) {
+		if ( VrMerc_StrEqNoCase( names[i], "default" ) ) {
+			return i;
+		}
+	}
+	return count > 0 ? 0 : -1;
+}
+
+/* Legacy md3 characters need lower_X and upper_X with the same X.  Returns the index
+ * into `lower` of the common name (default preferred), or -1. */
+static inline int VrMerc_PickCommonSkin( char lower[][VRMERC_NAME_LEN], int nLower,
+										 char upper[][VRMERC_NAME_LEN], int nUpper ) {
+	int i, j, first = -1;
+
+	for ( i = 0; i < nLower; i++ ) {
+		for ( j = 0; j < nUpper; j++ ) {
+			if ( VrMerc_StrEqNoCase( lower[i], upper[j] ) ) {
+				if ( VrMerc_StrEqNoCase( lower[i], "default" ) ) {
+					return i;
+				}
+				if ( first < 0 ) {
+					first = i;
+				}
+			}
+		}
+	}
+	return first;
+}
+
+/* ---- text scanning of wolfanim.cfg / wolfanim.script ---------------------- */
+static inline int VrMerc_IsSpace( int c ) {
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+/* Next whitespace-separated token; skips // and C comments.  Returns its length (0 at end). */
+static inline int VrMerc_NextToken( const char **p, char *out, int outSize ) {
+	const char *s = *p;
+	int n = 0;
+
+	for ( ;; ) {
+		while ( *s && VrMerc_IsSpace( (unsigned char)*s ) ) {
+			s++;
+		}
+		if ( s[0] == '/' && s[1] == '/' ) {
+			while ( *s && *s != '\n' ) {
+				s++;
+			}
+			continue;
+		}
+		if ( s[0] == '/' && s[1] == '*' ) {
+			s += 2;
+			while ( *s && !( s[0] == '*' && s[1] == '/' ) ) {
+				s++;
+			}
+			if ( *s ) {
+				s += 2;
+			}
+			continue;
+		}
+		break;
+	}
+	while ( *s && !VrMerc_IsSpace( (unsigned char)*s ) && ( *s != '{' && *s != '}' ) && n < outSize - 1 ) {
+		out[n++] = *s++;
+	}
+	if ( n == 0 && ( *s == '{' || *s == '}' ) ) {
+		out[n++] = *s++;
+	}
+	out[n] = 0;
+	*p = s;
+	return n;
+}
+
+/* Value of the cfg "version" token (the parser's default is 0). */
+static inline int VrMerc_CfgVersion( const char *text ) {
+	const char *p = text;
+	char tok[VRMERC_NAME_LEN];
+
+	while ( VrMerc_NextToken( &p, tok, sizeof( tok ) ) ) {
+		if ( VrMerc_StrEqNoCase( tok, "version" ) ) {
+			if ( VrMerc_NextToken( &p, tok, sizeof( tok ) ) ) {
+				int v = 0, i = 0, neg = 0;
+
+				if ( tok[0] == '-' ) {
+					neg = 1;
+					i = 1;
+				}
+				for ( ; tok[i] >= '0' && tok[i] <= '9'; i++ ) {
+					v = v * 10 + ( tok[i] - '0' );
+				}
+				return neg ? -v : v;
+			}
+			return 0;
+		}
+	}
+	return 0;
+}
+
+/* Which AI states the script defines ("STATE <name> {" blocks). */
+static inline int VrMerc_ScriptStateMask( const char *text ) {
+	const char *p = text;
+	char tok[VRMERC_NAME_LEN];
+	int mask = 0, afterState = 0;
+
+	while ( VrMerc_NextToken( &p, tok, sizeof( tok ) ) ) {
+		if ( afterState ) {
+			if ( VrMerc_StrEqNoCase( tok, "relaxed" ) ) {
+				mask |= VRMERC_STATE_RELAXED;
+			} else if ( VrMerc_StrEqNoCase( tok, "query" ) ) {
+				mask |= VRMERC_STATE_QUERY;
+			} else if ( VrMerc_StrEqNoCase( tok, "alert" ) ) {
+				mask |= VRMERC_STATE_ALERT;
+			} else if ( VrMerc_StrEqNoCase( tok, "combat" ) ) {
+				mask |= VRMERC_STATE_COMBAT;
+			}
+			afterState = 0;
+		} else if ( VrMerc_StrEqNoCase( tok, "state" ) ) {
+			afterState = 1;
+		}
+	}
+	return mask;
+}
+
+/* ---- exact missing-resource report ---------------------------------------- */
+static inline int VrMerc_Append( char *out, int outSize, int len, const char *a, const char *b, const char *c ) {
+	const char *parts[3];
+	int i;
+
+	parts[0] = a;
+	parts[1] = b;
+	parts[2] = c;
+	for ( i = 0; i < 3; i++ ) {
+		const char *s = parts[i];
+
+		while ( s && *s && len < outSize - 1 ) {
+			out[len++] = *s++;
+		}
+	}
+	out[len] = 0;
+	return len;
+}
+
+/* Writes "models/players/<model>/<file>; ..." for everything that is missing.  `bodySkin`
+ * and `headSkin` are the names that were tried (the discovered ones, or "default" when
+ * nothing was found).  Returns the number of missing items. */
+static inline int VrMerc_DescribeMissing( const char *model, const char *bodySkin, const char *headSkin,
+										  const vrMercModelFiles_t *f, char *out, int outSize ) {
+	int len = 0, count = 0;
+	int skeletal = f->hasBodySkin && f->hasBodyMesh;
+	int legacy = f->hasLowerSkin && f->hasUpperSkin && f->hasLowerMesh && f->hasUpperMesh;
+
+	out[0] = 0;
+#define VRMERC_MISSING( cond, mid, name, suffix ) \
+	if ( cond ) { \
+		len = VrMerc_Append( out, outSize, len, count ? "; " : "", "models/players/", model ); \
+		len = VrMerc_Append( out, outSize, len, "/", mid, name ); \
+		len = VrMerc_Append( out, outSize, len, suffix, "", "" ); \
+		count++; \
+	}
+	VRMERC_MISSING( !f->hasAnimCfg, "", "wolfanim.cfg", "" )
+	VRMERC_MISSING( !VrMerc_AnimScriptAvailable( f ), "", "wolfanim.script", "" )
+	if ( !skeletal && !legacy ) {
+		VRMERC_MISSING( !f->hasBodySkin, "body_", bodySkin, ".skin" )
+		VRMERC_MISSING( !f->hasBodyMesh, "", "body.mds", "" )
+	}
+	VRMERC_MISSING( !f->hasHeadSkin, "head_", headSkin, ".skin" )
+#undef VRMERC_MISSING
+	if ( f->hasAnimCfg && VrMerc_AnimScriptAvailable( f ) &&
+		 ( f->scriptStateMask & VRMERC_STATES_REQUIRED ) != VRMERC_STATES_REQUIRED ) {
+		len = VrMerc_Append( out, outSize, len, count ? "; " : "", "animation script has no RELAXED/ALERT/COMBAT AI states", "" );
+		count++;
+	}
+	return count;
 }
 
 /* A resting surface is walkable when its normal is steep enough. */

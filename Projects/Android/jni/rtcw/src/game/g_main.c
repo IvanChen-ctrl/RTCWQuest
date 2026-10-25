@@ -65,7 +65,7 @@ vmCvar_t g_reloading;       //----(SA)	added
 vmCvar_t vr_godmode;        // single-player God Mode (VR notebook / console), default off
 vmCvar_t vr_merc;           // companion requested for this session (hire/dismiss intent)
 vmCvar_t vr_merc_assist;    // companion may engage hostile targets
-vmCvar_t vr_merc_char;      // soldier type for the next hire: 0 American, 1 Partisan
+vmCvar_t vr_merc_model;     // preferred model directory for the next hire ("" = automatic)
 
 vmCvar_t g_dmflags;
 vmCvar_t g_fraglimit;
@@ -168,7 +168,7 @@ cvarTable_t gameCvarTable[] = {
 	{ &vr_godmode, "vr_godmode", "0", 0, 0, qfalse },
 	{ &vr_merc, "vr_merc", "0", 0, 0, qfalse },
 	{ &vr_merc_assist, "vr_merc_assist", "1", 0, 0, qfalse },
-	{ &vr_merc_char, "vr_merc_char", "0", 0, 0, qfalse },
+	{ &vr_merc_model, "vr_merc_model", "", 0, 0, qfalse },
 
 // JPW NERVE multiplayer stuffs
 	{ &g_redlimbotime, "g_redlimbotime", "30000", CVAR_SERVERINFO | CVAR_LATCH, 0, qfalse },
