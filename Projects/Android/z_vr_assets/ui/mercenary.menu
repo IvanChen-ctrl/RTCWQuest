@@ -49,7 +49,7 @@ itemDef {
   name title
   group page
   rect 64 66 500 30
-  text "MERCENARY ORDERS:"
+  text "MERCENARY SQUAD:"
   textfont UI_FONT_HANDWRITING
   textscale .35
   forecolor .1 .1 .1 .75
@@ -61,7 +61,7 @@ itemDef {
   name hint
   group page
   rect 64 96 520 20
-  text "Close the notebook after a choice. Attack: aim, then pull the trigger."
+  text "Orders go to the soldier chosen below. Close the notebook after a choice. Attack: aim, then fire."
   textfont UI_FONT_HANDWRITING
   textscale .22
   textaligny 14
@@ -71,9 +71,25 @@ itemDef {
 }
 
 itemDef {
+  name m_select
+  group page
+  rect 64 130 270 26
+  type ITEM_TYPE_MULTI
+  style WINDOW_STYLE_EMPTY
+  text "> Orders go to:"
+  cvar "vr_merc_sel"
+  cvarFloatList { "All soldiers" 0 "Mercenary 1" 1 "Mercenary 2" 2 "Mercenary 3" 3 "Mercenary 4" 4 }
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 18
+  forecolor .1 .1 .1 .75
+  visible 1
+}
+
+itemDef {
   name m_follow
   group page
-  rect 64 140 270 26
+  rect 64 176 270 26
   type ITEM_TYPE_BUTTON
   style WINDOW_STYLE_EMPTY
   text "> Follow me"
@@ -88,7 +104,7 @@ itemDef {
 itemDef {
   name m_hold
   group page
-  rect 64 192 270 26
+  rect 64 222 270 26
   type ITEM_TYPE_BUTTON
   style WINDOW_STYLE_EMPTY
   text "> Hold position"
@@ -101,9 +117,24 @@ itemDef {
 }
 
 itemDef {
+  name m_regroup
+  group page
+  rect 64 268 270 26
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Regroup"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 18
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; exec "merc regroup;" }
+}
+
+itemDef {
   name m_attack
   group page
-  rect 64 244 270 26
+  rect 64 314 270 26
   type ITEM_TYPE_BUTTON
   style WINDOW_STYLE_EMPTY
   text "> Attack my target"
@@ -118,7 +149,7 @@ itemDef {
 itemDef {
   name m_cover
   group page
-  rect 64 296 270 26
+  rect 64 360 270 26
   type ITEM_TYPE_BUTTON
   style WINDOW_STYLE_EMPTY
   text "> Cover me"
@@ -131,24 +162,9 @@ itemDef {
 }
 
 itemDef {
-  name m_regroup
-  group page
-  rect 64 348 270 26
-  type ITEM_TYPE_BUTTON
-  style WINDOW_STYLE_EMPTY
-  text "> Regroup"
-  textfont UI_FONT_HANDWRITING
-  textscale .3
-  textaligny 18
-  forecolor .1 .1 .1 .75
-  visible 1
-  action { play "sound/notebook/book_pageflip.wav"; exec "merc regroup;" }
-}
-
-itemDef {
   name m_hire
   group page
-  rect 340 140 250 26
+  rect 340 130 250 26
   type ITEM_TYPE_BUTTON
   style WINDOW_STYLE_EMPTY
   text "> Hire a mercenary"
@@ -163,7 +179,7 @@ itemDef {
 itemDef {
   name m_defensive
   group page
-  rect 340 192 250 26
+  rect 340 176 250 26
   type ITEM_TYPE_BUTTON
   style WINDOW_STYLE_EMPTY
   text "> Defensive stance"
@@ -178,7 +194,7 @@ itemDef {
 itemDef {
   name m_aggressive
   group page
-  rect 340 244 250 26
+  rect 340 222 250 26
   type ITEM_TYPE_BUTTON
   style WINDOW_STYLE_EMPTY
   text "> Aggressive stance"
@@ -193,7 +209,7 @@ itemDef {
 itemDef {
   name m_assist
   group page
-  rect 340 296 250 26
+  rect 340 268 250 26
   type ITEM_TYPE_BUTTON
   style WINDOW_STYLE_EMPTY
   text "> Assist on / off"
@@ -208,16 +224,31 @@ itemDef {
 itemDef {
   name m_dismiss
   group page
-  rect 340 348 250 26
+  rect 340 314 250 26
   type ITEM_TYPE_BUTTON
   style WINDOW_STYLE_EMPTY
-  text "> Dismiss"
+  text "> Dismiss selected"
   textfont UI_FONT_HANDWRITING
   textscale .3
   textaligny 18
   forecolor .1 .1 .1 .75
   visible 1
   action { play "sound/notebook/book_pageflip.wav"; exec "merc dismiss;" }
+}
+
+itemDef {
+  name m_dismissall
+  group page
+  rect 340 360 250 26
+  type ITEM_TYPE_BUTTON
+  style WINDOW_STYLE_EMPTY
+  text "> Dismiss all"
+  textfont UI_FONT_HANDWRITING
+  textscale .3
+  textaligny 18
+  forecolor .1 .1 .1 .75
+  visible 1
+  action { play "sound/notebook/book_pageflip.wav"; exec "merc dismiss all;" }
 }
 
 } // end menudef

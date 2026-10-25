@@ -1100,6 +1100,8 @@ extern vmCvar_t vr_merc_model;
 extern vmCvar_t vr_merc_stance;
 extern vmCvar_t vr_merc_diag;
 extern vmCvar_t vr_merc_move;
+extern vmCvar_t vr_merc_squad;
+extern vmCvar_t vr_merc_sel;
 float    VrMerc_SpeedScaleFloor( int entNum, float runSpeed );
 qboolean G_VrGodProtects( gentity_t *targ, int dflags );
 void     G_VrGodModeChanged( void );

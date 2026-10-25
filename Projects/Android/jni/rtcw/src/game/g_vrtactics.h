@@ -136,6 +136,13 @@ typedef enum {
 	VRTAC_R_ARRIVED,
 	VRTAC_R_COMBAT_OVER,
 	VRTAC_R_GAVE_UP,
+	/* squad */
+	VRTAC_R_SQUAD_FULL,
+	VRTAC_R_NO_SLOT,
+	VRTAC_R_SPAWN_PENDING,
+	VRTAC_R_SEPARATION,
+	VRTAC_R_SLOT_FAR,
+	VRTAC_R_NO_AMMO,
 	VRTAC_R_COUNT
 } vrTacReason_t;
 
@@ -155,7 +162,8 @@ static inline const char *VrTac_ReasonName( int r ) {
 		"command", "sustained_fire", "heavy_damage", "exposed_hold", "low_health", "isolated",
 		"line_of_fire", "aggressive", "clear_behind",
 		"too_close", "in_front", "nav_solid", "nav_unreachable",
-		"target_seen", "too_far", "arrived", "combat_over", "gave_up"
+		"target_seen", "too_far", "arrived", "combat_over", "gave_up",
+		"squad_full", "no_slot", "spawn_pending", "separation", "slot_far", "no_ammo"
 	};
 
 	if ( r < 0 || r >= VRTAC_R_COUNT ) {
@@ -345,7 +353,10 @@ typedef struct {
 	int   msSinceHurtSelf;      /* -1 if it did not damage the companion recently       */
 	int   designated;       /* the player pointed at it                                 */
 	int   inWeaponRange;
+	int   squadClaims;      /* how many OTHER companions have committed to this target  */
 } vrTacCand_t;
+
+#define VRTAC_CLAIM_PENALTY     28.0f   /* per squad mate already on the target (max 2 count)  */
 
 typedef struct {
 	int stance;             /* vrTacStance_t              */
@@ -394,6 +405,12 @@ static inline float VrTac_ThreatScore( const vrTacCand_t *c, const vrTacScorePar
 	s += c->inWeaponRange ? 15.0f : -25.0f;
 	if ( c->designated ) {
 		s += 200.0f;
+	}
+	/* spread the squad's fire: a target that squad mates already engage is less attractive, unless it
+	 * is a particularly dangerous one (designated, shooting at the player, just hurt the player) */
+	if ( c->squadClaims > 0 && !c->designated && !c->targetsPlayer &&
+		 !( c->msSinceHurtPlayer >= 0 && c->msSinceHurtPlayer < 1500 ) ) {
+		s -= VRTAC_CLAIM_PENALTY * (float)( c->squadClaims > 2 ? 2 : c->squadClaims );
 	}
 	return s < 0.0f ? 0.0f : s;
 }
@@ -684,6 +701,8 @@ typedef struct {
 	float healthFrac;
 	int   cooldownOk;       /* the cover cooldown has elapsed                          */
 	int   maneuverActive;   /* another maneuver is running                             */
+	int   outOfAmmo;        /* the current weapon cannot fire                          */
+	int   recentDamage;     /* hit at least once in the last few seconds               */
 } vrTacCoverWant_t;
 
 /* Should the companion look for cover now?  Returns 1 and sets *reason, or 0. */
@@ -697,6 +716,14 @@ static inline int VrTac_WantCover( const vrTacCoverWant_t *w, int *reason ) {
 	}
 	if ( w->heavyDamage ) {
 		*reason = VRTAC_R_HEAVY_DAMAGE;
+		return 1;
+	}
+	if ( w->outOfAmmo && w->targetVisible ) {
+		*reason = VRTAC_R_NO_AMMO;              /* cannot shoot back: get out of the line of fire */
+		return 1;
+	}
+	if ( w->healthFrac < 0.5f && w->recentDamage ) {
+		*reason = VRTAC_R_LOW_HEALTH;           /* a wounded soldier is more cautious */
 		return 1;
 	}
 	if ( w->sustainedFire && ( w->stance == VRTAC_STANCE_DEFENSIVE || w->healthFrac < 0.5f ) ) {

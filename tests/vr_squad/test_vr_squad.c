@@ -15,6 +15,7 @@
 
 #include "g_vrmove.h"
 #include "g_vrtactics.h"
+#include "g_vrsquad.h"
 
 static int failures;
 static int checks;
@@ -465,6 +466,492 @@ static void test_trail_pick(void)
     CHECK(VrTrail_Pick(&t, 6000 + VRMOVE_TRAIL_MAX_MS, travel, far_) == -1);
 }
 
+
+/* ===================== squad bookkeeping ===================== */
+
+static void test_squad_limit(void)
+{
+    CHECK(VrSquad_Limit(0) == VRSQUAD_DEFAULT_LIMIT);            /* default for the first hardware test: 2 */
+    CHECK(VrSquad_Limit(-3) == VRSQUAD_DEFAULT_LIMIT);
+    CHECK(VrSquad_Limit(1) == 1);
+    CHECK(VrSquad_Limit(2) == 2);
+    CHECK(VrSquad_Limit(3) == 3);
+    CHECK(VrSquad_Limit(4) == 4);
+    CHECK(VrSquad_Limit(5) == VRMERC_MAX_SQUAD);                 /* never above the instance array */
+    CHECK(VrSquad_Limit(1000) == VRMERC_MAX_SQUAD);
+    CHECK(VRSQUAD_DEFAULT_LIMIT == 2);
+}
+
+static void test_squad_can_add(void)
+{
+    CHECK(VrSquad_CanAdd(0, 0, 2) == VRSQ_OK);
+    CHECK(VrSquad_CanAdd(1, 0, 2) == VRSQ_OK);
+    CHECK(VrSquad_CanAdd(2, 0, 2) == VRSQ_FULL);                  /* clear refusal, not a silent failure */
+    CHECK(VrSquad_CanAdd(1, 1, 2) == VRSQ_PENDING);               /* one recruit at a time */
+    CHECK(VrSquad_CanAdd(2, 1, 2) == VRSQ_PENDING);
+    CHECK(VrSquad_CanAdd(3, 0, 4) == VRSQ_OK);
+    CHECK(VrSquad_CanAdd(4, 0, 4) == VRSQ_FULL);
+    CHECK(VrSquad_CanAdd(4, 0, 99) == VRSQ_NO_INSTANCE);          /* a bad limit cannot overrun the array */
+}
+
+static void test_squad_free_instance(void)
+{
+    int used[VRMERC_MAX_SQUAD] = { 0, 0, 0, 0 };
+
+    CHECK(VrSquad_PickFreeInstance(used, VRMERC_MAX_SQUAD) == 0);
+    used[0] = 1;
+    CHECK(VrSquad_PickFreeInstance(used, VRMERC_MAX_SQUAD) == 1);
+    used[1] = 1; used[3] = 1;
+    CHECK(VrSquad_PickFreeInstance(used, VRMERC_MAX_SQUAD) == 2);
+    used[2] = 1;
+    CHECK(VrSquad_PickFreeInstance(used, VRMERC_MAX_SQUAD) == -1);
+    used[0] = 0;                                                  /* a dismissed soldier frees its record */
+    CHECK(VrSquad_PickFreeInstance(used, VRMERC_MAX_SQUAD) == 0);
+}
+
+static void test_squad_unique_identity(void)
+{
+    int i, j;
+
+    for (i = 0; i < VRMERC_MAX_SQUAD; i++) {
+        CHECK(VrSquad_IdxFromName(VrSquad_AiName(i)) == i);       /* round trip */
+        for (j = i + 1; j < VRMERC_MAX_SQUAD; j++) {
+            CHECK(strcmp(VrSquad_AiName(i), VrSquad_AiName(j)) != 0);
+        }
+    }
+    CHECK(VrSquad_IdxFromName(NULL) == -1);
+    CHECK(VrSquad_IdxFromName("") == -1);
+    CHECK(VrSquad_IdxFromName("vr_merc_") == -1);
+    CHECK(VrSquad_IdxFromName("vr_merc_0") == -1);
+    CHECK(VrSquad_IdxFromName("vr_merc_5") == -1);
+    CHECK(VrSquad_IdxFromName("vr_merc_12") == -1);
+    CHECK(VrSquad_IdxFromName("vr_merc_1x") == -1);
+    CHECK(VrSquad_IdxFromName("american") == -1);                 /* a story character is not ours */
+    CHECK(VrSquad_IdxFromName("Vr_merc_1") == -1);
+    CHECK(strcmp(VrSquad_AiName(-1), "") == 0);
+    CHECK(strcmp(VrSquad_AiName(VRMERC_MAX_SQUAD), "") == 0);
+}
+
+static void test_squad_selection(void)
+{
+    int mask;
+    int live = 0x5;                                               /* companions 1 and 3 */
+
+    CHECK(VrSquad_ResolveSelection("", 0, live, &mask) == VRSQ_SEL_OK && mask == 0x5);       /* default: all */
+    CHECK(VrSquad_ResolveSelection("all", 2, live, &mask) == VRSQ_SEL_OK && mask == 0x5);    /* explicit beats cvar */
+    CHECK(VrSquad_ResolveSelection("ALL", 0, live, &mask) == VRSQ_SEL_OK && mask == 0x5);
+    CHECK(VrSquad_ResolveSelection("1", 0, live, &mask) == VRSQ_SEL_OK && mask == 0x1);
+    CHECK(VrSquad_ResolveSelection("3", 0, live, &mask) == VRSQ_SEL_OK && mask == 0x4);
+    CHECK(VrSquad_ResolveSelection("2", 0, live, &mask) == VRSQ_SEL_NO_SUCH && mask == 0);   /* not in the squad */
+    CHECK(VrSquad_ResolveSelection("4", 0, live, &mask) == VRSQ_SEL_NO_SUCH);
+    CHECK(VrSquad_ResolveSelection("5", 0, live, &mask) == VRSQ_SEL_BAD_ARG);
+    CHECK(VrSquad_ResolveSelection("0", 0, live, &mask) == VRSQ_SEL_BAD_ARG);
+    CHECK(VrSquad_ResolveSelection("12", 0, live, &mask) == VRSQ_SEL_BAD_ARG);
+    CHECK(VrSquad_ResolveSelection("x", 0, live, &mask) == VRSQ_SEL_BAD_ARG);
+    CHECK(VrSquad_ResolveSelection("", 3, live, &mask) == VRSQ_SEL_OK && mask == 0x4);       /* notebook selector */
+    CHECK(VrSquad_ResolveSelection("", 2, live, &mask) == VRSQ_SEL_NO_SUCH);                 /* selected one has died */
+    CHECK(VrSquad_ResolveSelection("", 9, live, &mask) == VRSQ_SEL_OK && mask == 0x5);       /* garbage selector = all */
+    CHECK(VrSquad_ResolveSelection("all", 0, 0, &mask) == VRSQ_SEL_NONE_ALIVE && mask == 0);
+    CHECK(VrSquad_ResolveSelection("", 0, 0, &mask) == VRSQ_SEL_NONE_ALIVE);
+    CHECK(VrSquad_ResolveSelection("1", 0, 0, &mask) == VRSQ_SEL_NO_SUCH);
+    CHECK(VrSquad_ResolveSelection("", 0, 0xFF, &mask) == VRSQ_SEL_OK && mask == 0xF);       /* extra bits ignored */
+}
+
+static void test_squad_rank_and_count(void)
+{
+    CHECK(VrSquad_CountBits(0) == 0);
+    CHECK(VrSquad_CountBits(0xF) == 4);
+    CHECK(VrSquad_Rank(0x5, 0) == 0);
+    CHECK(VrSquad_Rank(0x5, 2) == 1);                             /* companion 3 is the 2nd living soldier */
+    CHECK(VrSquad_Rank(0xF, 3) == 3);
+    CHECK(VrSquad_Rank(0x0, 3) == 0);
+    CHECK(VrSquad_WishAfterRemoval(3) == 2);
+    CHECK(VrSquad_WishAfterRemoval(1) == 0);
+    CHECK(VrSquad_WishAfterRemoval(0) == 0);
+}
+
+/* ===================== formation ===================== */
+
+static float dist3(const float *a, const float *b)
+{
+    return sqrtf((a[0]-b[0])*(a[0]-b[0]) + (a[1]-b[1])*(a[1]-b[1]) + (a[2]-b[2])*(a[2]-b[2]));
+}
+
+static void test_formation_roles_are_separate_and_behind(void)
+{
+    float player[3] = { 100, -50, 20 };
+    int yaw, narrow, a, b;
+
+    for (narrow = 0; narrow < 2; narrow++) {
+        for (yaw = 0; yaw < 360; yaw += 30) {
+            float slots[VRMERC_MAX_SQUAD][3], fx, fy, rx, ry;
+
+            VrTac_YawBasis((float)yaw, &fx, &fy, &rx, &ry);
+            for (a = 0; a < VRMERC_MAX_SQUAD; a++) {
+                VrSquad_Slot(player, (float)yaw, a, narrow, slots[a]);
+                CHECK((slots[a][0] - player[0]) * fx + (slots[a][1] - player[1]) * fy < 0.0f);   /* behind */
+                CHECK(VrTac_RepositionReason(slots[a], player, fx, fy) == VRTAC_REPOS_NONE);     /* not in the way */
+                CHECK(slots[a][2] == player[2]);
+            }
+            for (a = 0; a < VRMERC_MAX_SQUAD; a++) {
+                for (b = a + 1; b < VRMERC_MAX_SQUAD; b++) {
+                    CHECK(dist3(slots[a], slots[b]) > VRSQUAD_MIN_SEPARATION * (narrow ? 1.3f : 1.5f));   /* never stacked */
+                }
+            }
+        }
+    }
+}
+
+static void test_formation_left_right_roles(void)
+{
+    float player[3] = { 0, 0, 0 }, l[3], r[3];
+
+    VrSquad_Slot(player, 0.0f, VRSQ_ROLE_LEFT, 0, l);             /* player faces +x: left is +y */
+    VrSquad_Slot(player, 0.0f, VRSQ_ROLE_RIGHT, 0, r);
+    CHECK(l[1] > 0.0f && r[1] < 0.0f);
+    CHECK(fabsf(l[0] - r[0]) < 0.01f);                            /* same depth */
+    CHECK(fabsf(l[1] + r[1]) < 0.01f);                            /* mirror images */
+}
+
+static void test_formation_narrow_is_single_file(void)
+{
+    float player[3] = { 0, 0, 0 }, s[VRMERC_MAX_SQUAD][3];
+    int i;
+
+    for (i = 0; i < VRMERC_MAX_SQUAD; i++) {
+        VrSquad_Slot(player, 0.0f, i, 1, s[i]);
+        CHECK(fabsf(s[i][1]) < 0.01f);                            /* on the player's axis */
+        if (i > 0) {
+            CHECK(s[i][0] < s[i - 1][0] - 95.0f);                 /* strictly behind the previous one, spaced */
+        }
+    }
+    CHECK(VrSquad_IsNarrow(80, 90));
+    CHECK(!VrSquad_IsNarrow(150, 150));
+    CHECK(VrSquad_IsNarrow(0, 0));
+    CHECK(!VrSquad_IsNarrow(VRSQUAD_NARROW_WIDTH, 0));            /* threshold is exclusive */
+}
+
+static void test_formation_position_need(void)
+{
+    /* two soldiers stand on each other: only the higher number steps away */
+    CHECK(VrSquad_PositionNeed(1, 0, 0, 0, 30) == VRSQ_POS_SEPARATE);
+    CHECK(VrSquad_PositionNeed(0, 0, 0, 1, 30) == VRSQ_POS_NONE);           /* mate has a higher number: stay */
+    CHECK(VrSquad_PositionNeed(1, 0, 0, 0, VRSQUAD_MIN_SEPARATION) == VRSQ_POS_NONE);
+    /* player stood still, soldier far from its slot: go to it */
+    CHECK(VrSquad_PositionNeed(0, VRSQUAD_SLOT_RADIUS + 10, VRSQUAD_STILL_MS, -1, 0) == VRSQ_POS_SLOT);
+    CHECK(VrSquad_PositionNeed(0, VRSQUAD_SLOT_RADIUS + 10, VRSQUAD_STILL_MS - 1, -1, 0) == VRSQ_POS_NONE);
+    CHECK(VrSquad_PositionNeed(0, VRSQUAD_SLOT_RADIUS - 10, 99999, -1, 0) == VRSQ_POS_NONE);
+    /* separation wins over the slot rule */
+    CHECK(VrSquad_PositionNeed(2, 400, 5000, 0, 20) == VRSQ_POS_SEPARATE);
+}
+
+static void test_formation_settles_without_ping_pong(void)
+{
+    /* a soldier standing in its slot never asks to move; separation between two soldiers resolves in one step */
+    float player[3] = { 0, 0, 0 }, slot0[3], slot1[3];
+
+    VrSquad_Slot(player, 0.0f, 0, 0, slot0);
+    VrSquad_Slot(player, 0.0f, 1, 0, slot1);
+    CHECK(VrSquad_PositionNeed(0, dist3(slot0, slot0), 9999, -1, 0) == VRSQ_POS_NONE);
+    CHECK(dist3(slot0, slot1) >= VRSQUAD_MIN_SEPARATION);
+    CHECK(VrSquad_PositionNeed(1, 0, 9999, 0, dist3(slot0, slot1)) == VRSQ_POS_NONE);
+}
+
+static void test_spawn_clear(void)
+{
+    float mates[6] = { 0, 0, 0, 200, 0, 0 };
+    float a[3] = { 30, 0, 0 }, b[3] = { 100, 0, 0 }, c[3] = { 200, 20, 0 };
+
+    CHECK(!VrSquad_SpawnClear(a, mates, 2));                      /* on top of mate 1 */
+    CHECK(VrSquad_SpawnClear(b, mates, 2));
+    CHECK(!VrSquad_SpawnClear(c, mates, 2));                      /* on top of mate 2 */
+    CHECK(VrSquad_SpawnClear(a, mates, 0));                       /* nobody else: fine */
+}
+
+/* ===================== independent state ===================== */
+
+typedef struct {
+    int id;
+    vrMove_t move;
+    vrRecover_t rec;
+    vrTacDmgLog_t dmg;
+    int target;
+    int targetSince;
+} simSoldier_t;
+
+static void test_instances_are_independent(void)
+{
+    simSoldier_t sq[3];
+    float pos[3] = { 0, 0, 0 };
+    int i, t;
+
+    for (i = 0; i < 3; i++) {
+        memset(&sq[i], 0, sizeof(sq[i]));
+        sq[i].id = i + 1;
+        VrMove_Reset(&sq[i].move, 0);
+        VrRecover_Reset(&sq[i].rec, pos, 0);
+        VrTac_DmgReset(&sq[i].dmg);
+        sq[i].target = -1;
+    }
+    /* soldier 2 falls far behind, soldier 3 gets shot, soldier 1 is fine */
+    for (t = 0; t < 40; t++) {
+        vrMoveIn_t near_in = move_in(150, -1, 1, 200), far_in = move_in(900, -1, 1, 200);
+
+        VrMove_Update(&sq[0].move, &near_in, t * 100);
+        VrMove_Update(&sq[1].move, &far_in, t * 100);
+        VrMove_Update(&sq[2].move, &near_in, t * 100);
+        if (t % 5 == 0) {
+            VrTac_DmgAdd(&sq[2].dmg, t * 100, 12);
+        }
+    }
+    CHECK(sq[0].move.mode == VRMOVE_NEAR);
+    CHECK(sq[1].move.mode == VRMOVE_CATCHUP);
+    CHECK(sq[2].move.mode == VRMOVE_NEAR);
+    {
+        int hits, total;
+
+        VrTac_DmgWindow(&sq[0].dmg, 4000, 4000, &hits, &total);
+        CHECK(hits == 0);
+        VrTac_DmgWindow(&sq[2].dmg, 4000, 4000, &hits, &total);
+        CHECK(hits >= 3 && total >= 36);
+    }
+    /* soldier 2 gets stuck: its recovery ladder advances, the others are untouched */
+    {
+        int now, steps = 0;
+
+        for (now = 100; now < 20000; now += 100) {
+            steps += (VrRecover_Step(&sq[1].rec, pos, 1, now) != VRREC_NONE);
+        }
+        CHECK(steps >= 3);
+        CHECK(sq[0].rec.attempts == 0 && sq[2].rec.attempts == 0);
+    }
+}
+
+/* ===================== squad target distribution ===================== */
+
+static vrTacCand_t sq_cand(int ent, float dist)
+{
+    vrTacCand_t c;
+
+    memset(&c, 0, sizeof(c));
+    c.entNum = ent;
+    c.dist = dist;
+    c.distToPlayer = dist + 100;
+    c.visibleNow = 1;
+    c.msSinceSeen = 100;
+    c.msSinceHurtPlayer = -1;
+    c.msSinceHurtSelf = -1;
+    c.inWeaponRange = 1;
+    return c;
+}
+
+/* Soldiers choose one after the other and see the claims of those before them. */
+static void choose_targets(const vrTacCand_t *enemies, int n, int soldiers, int *chosen)
+{
+    vrTacScoreParams_t p;
+    int s, k;
+
+    p.stance = VRTAC_STANCE_DEFENSIVE;
+    p.coverMeActive = 0;
+    for (s = 0; s < soldiers; s++) {
+        float scores[8];
+        int claimsOnTarget[8], sw, pick;
+
+        memset(claimsOnTarget, 0, sizeof(claimsOnTarget));
+        for (k = 0; k < s; k++) {
+            int e;
+
+            for (e = 0; e < n; e++) {
+                if (enemies[e].entNum == chosen[k]) {
+                    claimsOnTarget[e]++;
+                }
+            }
+        }
+        for (k = 0; k < n; k++) {
+            vrTacCand_t c = enemies[k];
+
+            c.squadClaims = claimsOnTarget[k];
+            scores[k] = VrTac_ThreatScore(&c, &p);
+        }
+        pick = VrTac_SelectTarget(scores, n, -1, 0, &sw);
+        chosen[s] = pick >= 0 ? enemies[pick].entNum : -1;
+    }
+}
+
+static void test_squad_spreads_fire_over_similar_enemies(void)
+{
+    vrTacCand_t e[3];
+    int chosen[3];
+
+    e[0] = sq_cand(10, 500);
+    e[1] = sq_cand(11, 520);
+    e[2] = sq_cand(12, 540);
+    choose_targets(e, 3, 3, chosen);
+    CHECK(chosen[0] == 10);
+    CHECK(chosen[1] != chosen[0]);
+    CHECK(chosen[2] != chosen[0] && chosen[2] != chosen[1]);       /* three soldiers, three different targets */
+}
+
+static void test_squad_concentrates_on_the_dangerous_enemy(void)
+{
+    vrTacCand_t e[3];
+    int chosen[3];
+
+    e[0] = sq_cand(10, 500);
+    e[1] = sq_cand(11, 520);
+    e[1].targetsPlayer = 1;                                         /* shooting at the player */
+    e[2] = sq_cand(12, 540);
+    choose_targets(e, 3, 3, chosen);
+    CHECK(chosen[0] == 11 && chosen[1] == 11 && chosen[2] == 11);   /* concentrated fire is fine here */
+
+    e[1].targetsPlayer = 0;
+    e[1].designated = 1;                                            /* the player pointed at it */
+    choose_targets(e, 3, 3, chosen);
+    CHECK(chosen[0] == 11 && chosen[1] == 11 && chosen[2] == 11);
+}
+
+static void test_squad_single_enemy_all_engage(void)
+{
+    vrTacCand_t e[1];
+    int chosen[3];
+
+    e[0] = sq_cand(10, 500);
+    choose_targets(e, 1, 3, chosen);
+    CHECK(chosen[0] == 10 && chosen[1] == 10 && chosen[2] == 10);   /* nothing else to shoot: nobody stands idle */
+}
+
+static void test_squad_claim_penalty_is_bounded(void)
+{
+    vrTacScoreParams_t p;
+    vrTacCand_t c = sq_cand(10, 500);
+    float base, one, two, many;
+
+    p.stance = VRTAC_STANCE_DEFENSIVE;
+    p.coverMeActive = 0;
+    base = VrTac_ThreatScore(&c, &p);
+    c.squadClaims = 1; one = VrTac_ThreatScore(&c, &p);
+    c.squadClaims = 2; two = VrTac_ThreatScore(&c, &p);
+    c.squadClaims = 9; many = VrTac_ThreatScore(&c, &p);
+    CHECK(one < base && two < one);
+    CHECK(many == two);                                             /* capped: never a hole in the targeting */
+    CHECK(many > 0.0f);
+}
+
+/* ===================== wounded / out of ammo ===================== */
+
+static void test_wounded_and_no_ammo_seek_cover(void)
+{
+    vrTacCoverWant_t w;
+    int why;
+
+    memset(&w, 0, sizeof(w));
+    w.state = VRMERC_ENGAGE;
+    w.order = VRMERC_ORDER_FOLLOW;
+    w.stance = VRTAC_STANCE_AGGRESSIVE;
+    w.assist = 1;
+    w.haveTarget = 1;
+    w.targetVisible = 1;
+    w.targetDist = 700;
+    w.healthFrac = 1.0f;
+    w.cooldownOk = 1;
+    CHECK(!VrTac_WantCover(&w, &why));
+    w.healthFrac = 0.4f;
+    CHECK(!VrTac_WantCover(&w, &why));                              /* wounded but not being hit */
+    w.recentDamage = 1;
+    CHECK(VrTac_WantCover(&w, &why) && why == VRTAC_R_LOW_HEALTH);
+    w.healthFrac = 1.0f; w.recentDamage = 0; w.outOfAmmo = 1;
+    CHECK(VrTac_WantCover(&w, &why) && why == VRTAC_R_NO_AMMO);
+    w.targetVisible = 0;
+    CHECK(!VrTac_WantCover(&w, &why));                              /* nothing to hide from */
+}
+
+/* ===================== recruitment sequence ===================== */
+
+typedef struct {
+    int inUse[VRMERC_MAX_SQUAD];
+    int pending;
+    int limit;
+} simSquad_t;
+
+static int sim_live(const simSquad_t *s)
+{
+    int i, n = 0;
+
+    for (i = 0; i < VRMERC_MAX_SQUAD; i++) {
+        n += s->inUse[i];
+    }
+    return n;
+}
+
+static int sim_hire(simSquad_t *s)
+{
+    int r = VrSquad_CanAdd(sim_live(s), s->pending, s->limit), idx;
+
+    if (r != VRSQ_OK) {
+        return r;
+    }
+    idx = VrSquad_PickFreeInstance(s->inUse, VRMERC_MAX_SQUAD);
+    if (idx < 0) {
+        return VRSQ_NO_INSTANCE;
+    }
+    s->inUse[idx] = 1;
+    return VRSQ_OK;
+}
+
+static void test_repeated_recruitment_and_limits(void)
+{
+    simSquad_t s;
+    int i;
+
+    memset(&s, 0, sizeof(s));
+    s.limit = VrSquad_Limit(0);                                     /* 2 */
+    CHECK(sim_hire(&s) == VRSQ_OK);
+    CHECK(sim_hire(&s) == VRSQ_OK);
+    CHECK(sim_hire(&s) == VRSQ_FULL);                               /* reported, not silent */
+    CHECK(sim_live(&s) == 2);
+    s.limit = VrSquad_Limit(3);                                     /* owner raises it after the performance test */
+    CHECK(sim_hire(&s) == VRSQ_OK);
+    CHECK(sim_hire(&s) == VRSQ_FULL);
+    s.inUse[0] = 0;                                                 /* soldier 1 dies */
+    CHECK(sim_hire(&s) == VRSQ_OK);                                 /* its record and AI name are reused ... */
+    CHECK(s.inUse[0] == 1);
+    for (i = 0; i < 20; i++) {                                      /* ... and never beyond the limit */
+        sim_hire(&s);
+    }
+    CHECK(sim_live(&s) == 3);
+    s.pending = 1;
+    s.inUse[1] = 0;
+    CHECK(sim_hire(&s) == VRSQ_PENDING);                            /* one recruit at a time */
+}
+
+static void test_dismiss_all_then_rehire(void)
+{
+    simSquad_t s;
+    int i, mask;
+
+    memset(&s, 0, sizeof(s));
+    s.limit = 3;
+    sim_hire(&s); sim_hire(&s); sim_hire(&s);
+    mask = 0;
+    for (i = 0; i < VRMERC_MAX_SQUAD; i++) {
+        mask |= s.inUse[i] << i;
+    }
+    {
+        int sel;
+
+        CHECK(VrSquad_ResolveSelection("all", 0, mask, &sel) == VRSQ_SEL_OK && VrSquad_CountBits(sel) == 3);
+        for (i = 0; i < VRMERC_MAX_SQUAD; i++) {
+            if (sel & (1 << i)) {
+                s.inUse[i] = 0;
+            }
+        }
+    }
+    CHECK(sim_live(&s) == 0);
+    CHECK(VrSquad_ResolveSelection("all", 0, 0, &mask) == VRSQ_SEL_NONE_ALIVE);
+    CHECK(sim_hire(&s) == VRSQ_OK);                                 /* a fresh start works */
+    CHECK(s.inUse[0] == 1);
+}
+
 int main(void)
 {
     test_effective_distance();
@@ -492,6 +979,27 @@ int main(void)
     test_trail_records_only_real_movement();
     test_trail_ring_keeps_newest();
     test_trail_pick();
+
+    test_squad_limit();
+    test_squad_can_add();
+    test_squad_free_instance();
+    test_squad_unique_identity();
+    test_squad_selection();
+    test_squad_rank_and_count();
+    test_formation_roles_are_separate_and_behind();
+    test_formation_left_right_roles();
+    test_formation_narrow_is_single_file();
+    test_formation_position_need();
+    test_formation_settles_without_ping_pong();
+    test_spawn_clear();
+    test_instances_are_independent();
+    test_squad_spreads_fire_over_similar_enemies();
+    test_squad_concentrates_on_the_dangerous_enemy();
+    test_squad_single_enemy_all_engage();
+    test_squad_claim_penalty_is_bounded();
+    test_wounded_and_no_ammo_seek_cover();
+    test_repeated_recruitment_and_limits();
+    test_dismiss_all_then_rehire();
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

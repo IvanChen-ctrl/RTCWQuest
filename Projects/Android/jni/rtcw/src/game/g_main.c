@@ -67,6 +67,8 @@ vmCvar_t vr_merc;           // companion requested for this session (hire/dismis
 vmCvar_t vr_merc_assist;    // companion may engage hostile targets
 vmCvar_t vr_merc_model;     // preferred model directory for the next hire ("" = automatic)
 vmCvar_t vr_merc_stance;    // 0 = defensive, 1 = aggressive companion stance
+vmCvar_t vr_merc_squad;     // squad size limit, 1..4 (default 2 for the first hardware tests)
+vmCvar_t vr_merc_sel;       // soldier the notebook buttons address: 0 = all, 1..4 = one
 vmCvar_t vr_merc_move;      // adaptive follow / catch-up / recovery for the companion (1 = on)
 vmCvar_t vr_merc_diag;      // RTCWTactical logcat diagnostics: 0 off, 1 events, 2 also rejections
 
@@ -175,6 +177,8 @@ cvarTable_t gameCvarTable[] = {
 	{ &vr_merc_stance, "vr_merc_stance", "0", 0, 0, qfalse },
 	{ &vr_merc_diag, "vr_merc_diag", "1", 0, 0, qfalse },
 	{ &vr_merc_move, "vr_merc_move", "1", 0, 0, qfalse },
+	{ &vr_merc_squad, "vr_merc_squad", "2", 0, 0, qfalse },
+	{ &vr_merc_sel, "vr_merc_sel", "0", 0, 0, qfalse },
 
 // JPW NERVE multiplayer stuffs
 	{ &g_redlimbotime, "g_redlimbotime", "30000", CVAR_SERVERINFO | CVAR_LATCH, 0, qfalse },

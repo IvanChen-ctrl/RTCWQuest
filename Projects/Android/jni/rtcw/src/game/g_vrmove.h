@@ -62,6 +62,7 @@ typedef struct {
 	int   hasLOS;       /* clear line to the player                                   */
 	float playerSpeed;  /* horizontal player speed, units per second                  */
 	int   suppressed;   /* combat/maneuver/hold/script owns the movement              */
+	int   tight;        /* "cover me": stay closer (thresholds scale by 0.75)         */
 } vrMoveIn_t;
 
 static inline void VrMove_Reset( vrMove_t *m, int now ) {
@@ -83,6 +84,9 @@ static inline int VrMove_Update( vrMove_t *m, const vrMoveIn_t *in, int now ) {
 	int moving = in->playerSpeed >= VRMOVE_PLAYER_MOVING;
 	int target = m->mode;
 
+	if ( in->tight && d < VRMOVE_UNREACHABLE_DIST ) {
+		d /= 0.75f;                 /* same hysteresis, tighter distances */
+	}
 	if ( in->suppressed ) {
 		target = VRMOVE_NEAR;       /* combat decisions own the movement; drops at once */
 	} else {

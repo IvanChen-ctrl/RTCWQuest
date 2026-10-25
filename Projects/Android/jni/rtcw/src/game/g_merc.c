@@ -46,6 +46,7 @@ tests/vr_tactics.
 #include "g_vrlogic.h"
 #include "g_vrtactics.h"
 #include "g_vrmove.h"
+#include "g_vrsquad.h"
 
 #include "../../../RTCWVR/VrClientInfo.h"
 
@@ -102,27 +103,31 @@ typedef struct {
 } vrMercManeuver_t;
 
 typedef struct {
-	int id;                     // companion number (log identity); 1 for the first
+	vrTacCand_t cand[VRTAC_MAX_CAND];
+	float score[VRTAC_MAX_CAND];
+	int n;
+	vec3_t friends[VRTAC_MAX_FRIENDS];
+	int nFriends;
+	int sustained;              // sustained fire on the companion
+	int heavy;                  // heavy damage on the companion
+	int playerUnderFire;
+	int hostilesSeen;           // hostiles visible right now
+	float healthFrac;
+	float weaponRange;
+} vrMercCtx_t;
+
+typedef struct {
+	int id;                     // companion number (log identity and AI name suffix), 1..VRMERC_MAX_SQUAD
 	int state;                  // vrMercState_t
 	int order;                  // vrMercOrder_t
 	int slot;                   // entity (client) number of the companion, -1 if none
 	int character;              // AICHAR_* used for the current / pending companion
-	qboolean modelsProbed;      // model files were checked on this level
-	int numCand;                // candidates probed so far (native ones first)
-	vrMercCand_t cand[VRMERC_MAX_CAND];
-	int chosen;                 // index into cand[] used by the current / pending companion
+	int chosen;                 // index into sq.cand[] used by this companion
 	int holdGoal;               // entity number of the wait goal, -1 if none
 	vec3_t holdPos;
 	qboolean dismissRequested;
 
-	qboolean spawnPending;
-	int spawnStart;
-	int spawnEntity;            // temporary entity that AIChar_spawn will consume
-	int spawnAttempts;
-	int nextSpawnAttempt;
-
 	int nextThink;
-	int levelStart;
 	int lastTargetTime;
 	int returnAllowedAt;
 	vrMercProgress_t progress;
@@ -136,8 +141,6 @@ typedef struct {
 	int lastOverrideAt;         // last time the stock AI's target was replaced
 	int designated;             // entity the player pointed at, or -1
 	int designatedUntil;
-	int designateArmedUntil;    // waiting for the player's next fire press
-	int lastAttackButton;
 	int coverMeUntil;
 	vrTacDmgLog_t dmgSelf;      // damage taken by the companion
 	vrTacDmgLog_t dmgPlayer;    // damage taken by the player
@@ -177,13 +180,72 @@ typedef struct {
 	int supervisedFrames;
 	int stateChanges;
 	int perceptionRuns;
+
+	vrMercCtx_t ctx;            // this companion's own tactical context (rebuilt every 250 ms)
+	int nextSlotCheck;          // squad formation check
+	int lastRole;               // formation role last used (for merc_formation_changed)
 } vrMerc_t;
 
-static vrMerc_t merc;
+// State shared by the whole squad: one recruit may be on the way at a time, the model survey
+// is done once per level, and the "attack my target" arming is the player's, not a soldier's.
+typedef struct {
+	qboolean modelsProbed;      // model files were checked on this level
+	int numCand;                // candidates probed so far (native ones first)
+	vrMercCand_t cand[VRMERC_MAX_CAND];
+
+	qboolean spawnPending;      // a recruit is on the way (instance pendingIdx)
+	int pendingIdx;             // squad[] index of the recruit on the way, -1 if none
+	int spawnStart;
+	int spawnEntity;            // temporary entity that AIChar_spawn will consume
+	int spawnAttempts;
+	int nextSpawnAttempt;
+	int levelStart;
+
+	int designateArmedUntil;    // waiting for the player's next fire press
+	int lastAttackButton;
+	int narrow;                 // the player is in a corridor / doorway (single-file formation)
+	int nextNarrowCheck;
+	int playerStillSince;       // level time the player stopped moving (0 = moving)
+	int lastLimitLog;           // rate limit for merc_limit_reached
+	int nextPoll;               // spawn polling cadence
+	int designateMask;          // soldiers that the armed "attack my target" order addresses
+} vrSquad_t;
+
+static vrSquad_t sq;
+static vrMerc_t squad[VRMERC_MAX_SQUAD];
+static vrMerc_t *mcur = &squad[0];      // the soldier the code below is currently working on
+#define merc ( *mcur )
+#define mtx ( merc.ctx )
 static unsigned char mercMoveMode[MAX_CLIENTS];     // vrMoveMode_t per entity number (side table read by the AI think hook)
 
 static const vec3_t mercMins = { -18, -18, -24 };       // same box as BBOX_SMALL in ai_cast_characters.c
 static const vec3_t mercMaxs = { 18, 18, 48 };
+
+/*
+===============
+Soldier records
+===============
+*/
+static void VrMerc_InstInit( int idx ) {
+	vrMerc_t *m = &squad[idx];
+
+	memset( m, 0, sizeof( *m ) );
+	m->id = idx + 1;
+	m->state = VRMERC_NONE;
+	m->order = VRMERC_ORDER_FOLLOW;
+	m->slot = -1;
+	m->holdGoal = -1;
+	m->target = -1;
+	m->designated = -1;
+	m->hurtSelfBy = m->hurtPlayerBy = -1;
+	m->man.kind = MAN_NONE;
+	m->man.goalEnt = -1;
+	m->stance = vr_merc_stance.integer ? VRTAC_STANCE_AGGRESSIVE : VRTAC_STANCE_DEFENSIVE;
+	m->lastRole = -1;
+	VrMove_Reset( &m->move, level.time );
+	VrTac_DmgReset( &m->dmgSelf );
+	VrTac_DmgReset( &m->dmgPlayer );
+}
 
 /*
 ===============
@@ -203,10 +265,40 @@ static gentity_t *VrMerc_Player( void ) {
 }
 
 static qboolean VrMerc_IsCompanion( gentity_t *ent ) {
-	return ent && ent->inuse && ent->client && ( ent->r.svFlags & SVF_CASTAI ) &&
-		   ent->aiName && !strcmp( ent->aiName, VRMERC_AINAME );
+	return ( ent && ent->inuse && ent->client && ( ent->r.svFlags & SVF_CASTAI ) &&
+			 VrSquad_IdxFromName( ent->aiName ) >= 0 ) ? qtrue : qfalse;
 }
 
+// The soldier record that owns this entity number, or NULL.
+static vrMerc_t *VrMerc_ForEntity( int entNum ) {
+	int i;
+
+	for ( i = 0; i < VRMERC_MAX_SQUAD; i++ ) {
+		if ( squad[i].slot >= 0 && squad[i].slot == entNum ) {
+			return &squad[i];
+		}
+	}
+	return NULL;
+}
+
+static int VrMerc_LiveMask( void ) {
+	int i, mask = 0;
+
+	for ( i = 0; i < VRMERC_MAX_SQUAD; i++ ) {
+		if ( squad[i].slot >= 0 ) {
+			mask |= 1 << i;
+		}
+	}
+	return mask;
+}
+
+static int VrMerc_LiveCount( void ) {
+	return VrSquad_CountBits( VrMerc_LiveMask() );
+}
+
+static int VrMerc_SquadLimit( void ) {
+	return VrSquad_Limit( vr_merc_squad.integer );
+}
 // The companion's entity, or NULL if it is not (or no longer) in the game.
 static gentity_t *VrMerc_Entity( void ) {
 	gentity_t *ent;
@@ -215,11 +307,20 @@ static gentity_t *VrMerc_Entity( void ) {
 		return NULL;
 	}
 	ent = &g_entities[merc.slot];
-	return VrMerc_IsCompanion( ent ) ? ent : NULL;
+	// the entity must carry THIS soldier's own AI name
+	return ( VrMerc_IsCompanion( ent ) && VrSquad_IdxFromName( ent->aiName ) == merc.id - 1 ) ? ent : NULL;
 }
-
 static void VrMerc_Message( const char *text ) {
 	trap_SendServerCommand( 0, va( "cp \"%s\n\"", text ) );
+}
+
+// A message from the current soldier: "Mercenary 2: ..." once the squad has several members.
+static void VrMerc_Say( const char *text ) {
+	if ( VrMerc_LiveCount() > 1 && !Q_strncmp( text, "Mercenary: ", 11 ) ) {
+		VrMerc_Message( va( "Mercenary %d: %s", merc.id, text + 11 ) );
+	} else {
+		VrMerc_Message( text );
+	}
 }
 
 static const char *VrMerc_HireReasonText( int reason ) {
@@ -230,7 +331,7 @@ static const char *VrMerc_HireReasonText( int reason ) {
 	case VRMERC_HIRE_CINEMATIC:         return "Mercenary: not during a cutscene";
 	case VRMERC_HIRE_LOADING:           return "Mercenary: level is still loading";
 	case VRMERC_HIRE_AI_DISABLED:       return "Mercenary: AI is disabled (bot_enable)";
-	case VRMERC_HIRE_ALREADY_ACTIVE:    return "Mercenary: already hired";
+	case VRMERC_HIRE_ALREADY_ACTIVE:    return "Mercenary: squad is full";
 	case VRMERC_HIRE_SPAWN_PENDING:     return "Mercenary: already on the way";
 	case VRMERC_HIRE_NO_CLIENT_SLOT:    return "Mercenary: no free character slot";
 	case VRMERC_HIRE_NO_NAVIGATION:     return "Mercenary: this map has no navigation data";
@@ -423,24 +524,24 @@ static void VrMerc_NativeModelName( int aiChar, char *out, int outSize ) {
 static void VrMerc_ProbeModels( void ) {
 	int i;
 
-	if ( merc.modelsProbed ) {
+	if ( sq.modelsProbed ) {
 		return;
 	}
-	merc.numCand = 0;
-	for ( i = 0; i < (int)( sizeof( mercNativeChars ) / sizeof( mercNativeChars[0] ) ) && merc.numCand < VRMERC_MAX_CAND; i++ ) {
-		vrMercCand_t *c = &merc.cand[merc.numCand];
+	sq.numCand = 0;
+	for ( i = 0; i < (int)( sizeof( mercNativeChars ) / sizeof( mercNativeChars[0] ) ) && sq.numCand < VRMERC_MAX_CAND; i++ ) {
+		vrMercCand_t *c = &sq.cand[sq.numCand];
 		char model[VRMERC_NAME_LEN];
 
 		memset( c, 0, sizeof( *c ) );
 		c->aiChar = mercNativeChars[i];
 		VrMerc_NativeModelName( c->aiChar, model, sizeof( model ) );
 		VrMerc_ProbeModelDir( c, model );
-		merc.numCand++;
+		sq.numCand++;
 	}
-	merc.modelsProbed = qtrue;
+	sq.modelsProbed = qtrue;
 }
 
-// Index into merc.cand[] of the pairing to spawn, or -1.  A model named by the cvar
+// Index into sq.cand[] of the pairing to spawn, or -1.  A model named by the cvar
 // vr_merc_model is tried first; it may be a native model or any other directory under
 // models/players that passes the same checks (it then gets the American behaviour).
 static int VrMerc_PickModel( void ) {
@@ -452,24 +553,24 @@ static int VrMerc_PickModel( void ) {
 
 	trap_Cvar_VariableStringBuffer( "vr_merc_model", want, sizeof( want ) );
 	if ( want[0] ) {
-		for ( i = 0; i < merc.numCand; i++ ) {
-			if ( VrMerc_StrEqNoCase( merc.cand[i].model, want ) ) {
+		for ( i = 0; i < sq.numCand; i++ ) {
+			if ( VrMerc_StrEqNoCase( sq.cand[i].model, want ) ) {
 				preferred = i;
 			}
 		}
-		if ( preferred < 0 && merc.numCand < VRMERC_MAX_CAND ) {
-			vrMercCand_t *c = &merc.cand[merc.numCand];
+		if ( preferred < 0 && sq.numCand < VRMERC_MAX_CAND ) {
+			vrMercCand_t *c = &sq.cand[sq.numCand];
 
 			memset( c, 0, sizeof( *c ) );
 			c->aiChar = AICHAR_AMERICAN;
 			VrMerc_ProbeModelDir( c, want );
-			preferred = merc.numCand++;
+			preferred = sq.numCand++;
 		}
 	}
-	for ( i = 0; i < merc.numCand; i++ ) {
-		problems[i] = merc.cand[i].problem;
+	for ( i = 0; i < sq.numCand; i++ ) {
+		problems[i] = sq.cand[i].problem;
 	}
-	return VrMerc_PickFirstViable( problems, merc.numCand, preferred );
+	return VrMerc_PickFirstViable( problems, sq.numCand, preferred );
 }
 
 static void VrMerc_BuildHireContext( gentity_t *player, vrMercHireContext_t *c ) {
@@ -480,8 +581,8 @@ static void VrMerc_BuildHireContext( gentity_t *player, vrMercHireContext_t *c )
 	c->cameraActive = ( player && VrMerc_CameraActive( player ) );
 	c->loading = VrMerc_Loading();
 	c->aiEnabled = ( trap_Cvar_VariableIntegerValue( "bot_enable" ) != 0 );
-	c->companionActive = ( VrMerc_Entity() != NULL );
-	c->spawnPending = merc.spawnPending;
+	c->companionActive = ( VrMerc_LiveCount() >= VrMerc_SquadLimit() );     // "squad full"
+	c->spawnPending = sq.spawnPending;
 	c->freeClientSlots = aicast_maxclients - level.numPlayingClients;
 	c->navigationLoaded = trap_AAS_Initialized() ? 1 : 0;
 	c->modelUsable = ( VrMerc_PickModel() >= 0 );
@@ -498,6 +599,7 @@ are the temporary goal entities it walks to.
 */
 qboolean VrMerc_IsMercEntity( int entnum ) {
 	gentity_t *ent;
+	int i;
 
 	if ( entnum < 0 || entnum >= MAX_GENTITIES ) {
 		return qfalse;
@@ -506,39 +608,44 @@ qboolean VrMerc_IsMercEntity( int entnum ) {
 	if ( VrMerc_IsCompanion( ent ) ) {
 		return qtrue;
 	}
-	// the companion's temporary destination entities (HOLD post, maneuver goal) mean nothing without it
-	if ( ent->inuse && ent->classname && entnum >= 0 &&
-		 ( ( entnum == merc.holdGoal && !strcmp( ent->classname, VRMERC_WAITGOAL ) ) ||
-		   ( entnum == merc.man.goalEnt && !strcmp( ent->classname, VRMERC_MANGOAL ) ) ) ) {
-		return qtrue;
+	// every soldier's temporary destination entities (HOLD post, maneuver goal) mean nothing without it
+	if ( ent->inuse && ent->classname ) {
+		for ( i = 0; i < VRMERC_MAX_SQUAD; i++ ) {
+			if ( ( entnum == squad[i].holdGoal && !strcmp( ent->classname, VRMERC_WAITGOAL ) ) ||
+				 ( entnum == squad[i].man.goalEnt && !strcmp( ent->classname, VRMERC_MANGOAL ) ) ) {
+				return qtrue;
+			}
+		}
 	}
 	// also the unconsumed spawn request, otherwise a save taken in that short window
 	// would bring a second companion back when it is loaded
-	return ( ent->inuse && ent->think == AIChar_spawn && ent->aiName &&
-			 !strcmp( ent->aiName, VRMERC_AINAME ) ) ? qtrue : qfalse;
+	return ( ent->inuse && ent->think == AIChar_spawn && VrSquad_IdxFromName( ent->aiName ) >= 0 ) ? qtrue : qfalse;
 }
-
 /*
 ===============
 VrMerc_DamageBlocked
 ===============
 */
 qboolean VrMerc_DamageBlocked( gentity_t *targ, gentity_t *attacker ) {
-	if ( !targ || !attacker || ( merc.slot < 0 && !merc.spawnPending ) ) {
+	int attackerComp, targComp;
+
+	if ( !targ || !attacker || ( VrMerc_LiveMask() == 0 && !sq.spawnPending ) ) {
 		return qfalse;
 	}
 	if ( g_gametype.integer != GT_SINGLE_PLAYER ) {
 		return qfalse;
 	}
+	attackerComp = VrMerc_IsCompanion( attacker );
+	// a soldier's own splash is left to the stock rules; every OTHER soldier is an ally and is protected
+	targComp = attackerComp ? ( targ == attacker ) : VrMerc_IsCompanion( targ );
 	return VrMerc_DamagePolicy(
-			   VrMerc_IsCompanion( attacker ),
+			   attackerComp,
 			   attacker->client && attacker->s.number == 0 && !( attacker->r.svFlags & SVF_CASTAI ),
-			   VrMerc_IsCompanion( targ ),
+			   targComp,
 			   targ->client && targ->s.number == 0 && !( targ->r.svFlags & SVF_CASTAI ),
 			   targ->aiTeam, AITEAM_ALLIES, AITEAM_NEUTRAL,
 			   ( targ->r.svFlags & SVF_CASTAI ) != 0 ) ? qtrue : qfalse;
 }
-
 /*
 ===============
 wait goal (HOLD anchor) helpers
@@ -675,20 +782,29 @@ Called from G_Damage for every hit: feeds the "recent damage" part of the tactic
 ===============
 */
 void VrMerc_NoteDamage( gentity_t *targ, gentity_t *attacker, int damage ) {
-	if ( merc.slot < 0 || !targ || damage <= 0 ) {
+	vrMerc_t *m;
+	int i;
+
+	if ( !targ || damage <= 0 || VrMerc_LiveMask() == 0 ) {
 		return;
 	}
-	if ( VrMerc_IsCompanion( targ ) ) {
-		VrTac_DmgAdd( &merc.dmgSelf, level.time, damage );
-		merc.hurtSelfAt = level.time;
-		merc.hurtSelfBy = ( attacker && attacker != targ ) ? attacker->s.number : -1;
+	m = VrMerc_IsCompanion( targ ) ? VrMerc_ForEntity( targ->s.number ) : NULL;
+	if ( m ) {
+		VrTac_DmgAdd( &m->dmgSelf, level.time, damage );
+		m->hurtSelfAt = level.time;
+		m->hurtSelfBy = ( attacker && attacker != targ ) ? attacker->s.number : -1;
 	} else if ( targ->client && targ->s.number == 0 && !( targ->r.svFlags & SVF_CASTAI ) ) {
-		VrTac_DmgAdd( &merc.dmgPlayer, level.time, damage );
-		merc.hurtPlayerAt = level.time;
-		merc.hurtPlayerBy = ( attacker && attacker != targ ) ? attacker->s.number : -1;
+		// the player was hurt: every soldier notes it for itself
+		for ( i = 0; i < VRMERC_MAX_SQUAD; i++ ) {
+			if ( squad[i].slot < 0 ) {
+				continue;
+			}
+			VrTac_DmgAdd( &squad[i].dmgPlayer, level.time, damage );
+			squad[i].hurtPlayerAt = level.time;
+			squad[i].hurtPlayerBy = ( attacker && attacker != targ ) ? attacker->s.number : -1;
+		}
 	}
 }
-
 static qboolean VrMerc_ScriptBusy( cast_state_t *cs ) {
 	// a mission script is steering this character: never interfere with it
 	return ( cs->castScriptStatus.castScriptEventIndex >= 0 ||
@@ -764,21 +880,7 @@ sighting of them, or the player explicitly pointed at them.  Nothing is read for
 companion has never detected.
 ===============
 */
-typedef struct {
-	vrTacCand_t cand[VRTAC_MAX_CAND];
-	float score[VRTAC_MAX_CAND];
-	int n;
-	vec3_t friends[VRTAC_MAX_FRIENDS];
-	int nFriends;
-	int sustained;              // sustained fire on the companion
-	int heavy;                  // heavy damage on the companion
-	int playerUnderFire;
-	int hostilesSeen;           // hostiles visible right now
-	float healthFrac;
-	float weaponRange;
-} vrMercCtx_t;
 
-static vrMercCtx_t mtx;
 
 static void VrMerc_SetStockTarget( gentity_t *ent, cast_state_t *cs, int target ) {
 	cast_visibility_t *vis = &cs->vislist[target];
@@ -888,6 +990,16 @@ static void VrMerc_Perceive( gentity_t *player, gentity_t *ent, cast_state_t *cs
 		c->msSinceHurtSelf = ( merc.hurtSelfBy == i && now - merc.hurtSelfAt < 3000 ) ? now - merc.hurtSelfAt : -1;
 		c->designated = ( i == merc.designated ) ? 1 : 0;
 		c->inWeaponRange = ( dist <= mtx.weaponRange ) ? 1 : 0;
+		{
+			// how many squad mates are already on this enemy (fire is spread unless the enemy is dangerous)
+			int j;
+
+			for ( j = 0; j < VRMERC_MAX_SQUAD; j++ ) {
+				if ( &squad[j] != mcur && squad[j].slot >= 0 && squad[j].target == i ) {
+					c->squadClaims++;
+				}
+			}
+		}
 		if ( c->visibleNow ) {
 			mtx.hostilesSeen++;
 		}
@@ -1018,7 +1130,7 @@ static vrTacOrderCtx_t VrMerc_OrderContext( gentity_t *player ) {
 	memset( &c, 0, sizeof( c ) );
 	c.companionPresent = ( comp != NULL );
 	c.companionAlive = ( comp && comp->health > 0 );
-	c.spawnPending = merc.spawnPending;
+	c.spawnPending = sq.spawnPending;
 	c.state = merc.state;
 	c.playerOk = ( player && player->health > 0 );
 	c.cinematic = ( player && VrMerc_CameraActive( player ) );
@@ -1027,13 +1139,23 @@ static vrTacOrderCtx_t VrMerc_OrderContext( gentity_t *player ) {
 	return c;
 }
 
-static qboolean VrMerc_Designate( gentity_t *player, gentity_t *comp ) {
+static qboolean VrMerc_Designate( gentity_t *player, int mask ) {
 	vec3_t start, dir, end, mins = { -6, -6, -6 }, maxs = { 6, 6, 6 };
 	trace_t tr;
 	gentity_t *t;
-	int cls, num;
-	cast_state_t *cs = AICast_GetCastState( comp->s.number );
+	int cls, num, i, applied = 0;
+	vrMerc_t *saved = mcur;
+	int first = -1;
 
+	for ( i = 0; i < VRMERC_MAX_SQUAD; i++ ) {
+		if ( ( mask & ( 1 << i ) ) && squad[i].slot >= 0 ) {
+			first = i;
+			break;
+		}
+	}
+	if ( first < 0 ) {
+		return qfalse;
+	}
 	VrMerc_PlayerAim( player, start, dir );
 	VectorMA( start, VRTAC_DESIGNATE_RANGE, dir, end );
 	trap_Trace( &tr, start, mins, maxs, end, player->s.number, MASK_SHOT );
@@ -1042,33 +1164,46 @@ static qboolean VrMerc_Designate( gentity_t *player, gentity_t *comp ) {
 	if ( num < 0 || num >= level.maxclients ) {
 		cls = VRTAC_R_NO_TARGET;        // a wall, a prop or nothing
 	} else {
+		gentity_t *comp = &g_entities[squad[first].slot];
+
 		t = &g_entities[num];
 		cls = VrTac_ClassifyTarget( t->inuse, t->health > 0, ( t->r.svFlags & SVF_CASTAI ) != 0,
-									num == player->s.number, num == comp->s.number, VrMerc_IsCompanion( t ),
-									comp->aiTeam, t->aiTeam, AITEAM_NEUTRAL );
+									num == player->s.number, VrMerc_IsCompanion( t ) && num == comp->s.number,
+									VrMerc_IsCompanion( t ), comp->aiTeam, t->aiTeam, AITEAM_NEUTRAL );
 		cls = VrTac_ValidateDesignation( cls, Distance( player->r.currentOrigin, t->r.currentOrigin ) );
 	}
 	if ( cls != VRTAC_OK ) {
+		mcur = &squad[first];
 		VrTac_Log( 1, "target_rejected", "ent=%d reason=%s", num, VrTac_ReasonName( cls ) );
+		mcur = saved;
 		VrMerc_Message( VrMerc_ReasonText( cls ) );
 		return qfalse;
 	}
 
 	t = &g_entities[num];
-	// the player pointed it out: tell the companion where it is (the AI's own "last known position")
-	VectorCopy( t->r.currentOrigin, cs->vislist[num].visible_pos );
-	cs->vislist[num].visible_timestamp = level.time;
-	cs->vislist[num].flags |= AIVIS_ENEMY;
+	for ( i = 0; i < VRMERC_MAX_SQUAD; i++ ) {
+		cast_state_t *cs;
 
-	merc.designated = num;
-	merc.designatedUntil = level.time + VRTAC_DESIGNATE_HOLD_MS;
-	merc.designateArmedUntil = 0;
-	merc.nextPerception = 0;
-	VrTac_Log( 1, "designate", "ent=%d dist=%.0f", num, Distance( player->r.currentOrigin, t->r.currentOrigin ) );
-	VrMerc_Message( "Mercenary: attacking your target" );
+		if ( !( mask & ( 1 << i ) ) || squad[i].slot < 0 ) {
+			continue;
+		}
+		mcur = &squad[i];
+		// the player pointed it out: tell the soldier where it is (the AI's own "last known position")
+		cs = AICast_GetCastState( squad[i].slot );
+		VectorCopy( t->r.currentOrigin, cs->vislist[num].visible_pos );
+		cs->vislist[num].visible_timestamp = level.time;
+		cs->vislist[num].flags |= AIVIS_ENEMY;
+		merc.designated = num;
+		merc.designatedUntil = level.time + VRTAC_DESIGNATE_HOLD_MS;
+		merc.nextPerception = 0;
+		VrTac_Log( 1, "designate", "ent=%d dist=%.0f", num, Distance( player->r.currentOrigin, t->r.currentOrigin ) );
+		applied++;
+	}
+	mcur = saved;
+	sq.designateArmedUntil = 0;
+	VrMerc_Message( applied > 1 ? "Mercenaries: attacking your target" : "Mercenary: attacking your target" );
 	return qtrue;
 }
-
 /*
 ===============
 Maneuver primitive: send the companion to a point through the stock chase function.
@@ -1245,8 +1380,10 @@ the stock leader logic does everything else.
 */
 static void VrMerc_Formation( gentity_t *player, gentity_t *ent, cast_state_t *cs ) {
 	vec3_t start, dir, slot, floor;
-	int reason, side, attempt, nav, why;
+	int inWay, need = VRSQ_POS_NONE, attempt, nav, why, role, live, k, mateIdx = -1, stillMs;
 	int now = level.time;
+	float mateDist = 99999.0f, slotDist;
+	const char *trigger;
 
 	if ( merc.state != VRMERC_FOLLOW || merc.order != VRMERC_ORDER_FOLLOW || merc.man.kind != MAN_NONE ||
 		 merc.move.mode != VRMOVE_NEAR ) {
@@ -1259,31 +1396,65 @@ static void VrMerc_Formation( gentity_t *player, gentity_t *ent, cast_state_t *c
 	if ( merc.target >= 0 || VrMerc_ScriptBusy( cs ) || cs->enemyNum >= 0 ) {
 		return;
 	}
+	live = VrMerc_LiveMask();
+	role = VrSquad_Rank( live, merc.id - 1 );
+	if ( role != merc.lastRole ) {
+		if ( merc.lastRole >= 0 ) {
+			VrMerc_Log( 1, "merc_formation_changed", "role=%d previous=%d squad=%d narrow=%d", role, merc.lastRole,
+						VrSquad_CountBits( live ), sq.narrow );
+		}
+		merc.lastRole = role;
+	}
+
+	// 1. in the player's way (too close, or in front of the weapon)
 	VrMerc_PlayerAim( player, start, dir );
-	reason = VrTac_RepositionReason( ent->r.currentOrigin, player->r.currentOrigin, dir[0], dir[1] );
-	if ( reason == VRTAC_REPOS_NONE ) {
+	inWay = VrTac_RepositionReason( ent->r.currentOrigin, player->r.currentOrigin, dir[0], dir[1] );
+
+	// 2. squad needs: distance to the nearest squad mate, and to this soldier's formation slot
+	for ( k = 0; k < VRMERC_MAX_SQUAD; k++ ) {
+		if ( &squad[k] != mcur && squad[k].slot >= 0 ) {
+			float dm = Distance( ent->r.currentOrigin, g_entities[squad[k].slot].r.currentOrigin );
+
+			if ( dm < mateDist ) {
+				mateDist = dm;
+				mateIdx = k;
+			}
+		}
+	}
+	VrSquad_Slot( player->r.currentOrigin, player->client->ps.viewangles[YAW], role, sq.narrow, slot );
+	slotDist = Distance( ent->r.currentOrigin, slot );
+	stillMs = sq.playerStillSince ? now - sq.playerStillSince : 0;
+	need = VrSquad_PositionNeed( merc.id - 1, slotDist, stillMs, mateIdx, mateDist );
+
+	if ( inWay == VRTAC_REPOS_NONE && need == VRSQ_POS_NONE ) {
 		return;
 	}
-	side = VrTac_PickSide( ent->r.currentOrigin, player->r.currentOrigin, player->client->ps.viewangles[YAW] );
-	for ( attempt = 0; attempt < 2; attempt++, side = -side ) {
-		VrTac_FormationSlot( player->r.currentOrigin, player->client->ps.viewangles[YAW], side,
-							 VRTAC_FORM_BACK, VRTAC_FORM_SIDE, slot );
+	trigger = inWay == VRTAC_REPOS_TOO_CLOSE ? "too_close" : inWay == VRTAC_REPOS_IN_FRONT ? "in_front" :
+			  need == VRSQ_POS_SEPARATE ? "separation" : "slot";
+
+	// the role slot first, then a closer one; both are checked against the navigation data
+	for ( attempt = 0; attempt < 2; attempt++ ) {
+		if ( attempt == 1 ) {
+			VrTac_FormationSlot( player->r.currentOrigin, player->client->ps.viewangles[YAW],
+								 role == VRSQ_ROLE_RIGHT ? 1 : -1, VRTAC_FORM_BACK * 0.7f, VRTAC_FORM_SIDE * 0.7f, slot );
+		}
 		nav = VrMerc_NavCheck( player, ent, cs, slot, floor, &why );
 		if ( nav < 0 || nav > 600 ) {
-			VrTac_Log( 2, "formation_slot_rejected", "side=%d reason=%s", side, VrTac_ReasonName( why ) );
+			VrTac_Log( 2, "formation_slot_rejected", "role=%d attempt=%d reason=%s", role, attempt, VrTac_ReasonName( why ) );
 			continue;
 		}
 		if ( VrMerc_ManeuverBegin( ent, cs, MAN_REPOSITION, floor, VRTAC_FORM_REACH, VRTAC_FORM_MAX_MS,
-								   reason == VRTAC_REPOS_TOO_CLOSE ? VRTAC_R_TOO_CLOSE : VRTAC_R_IN_FRONT ) ) {
+								   inWay == VRTAC_REPOS_TOO_CLOSE ? VRTAC_R_TOO_CLOSE :
+								   inWay == VRTAC_REPOS_IN_FRONT ? VRTAC_R_IN_FRONT :
+								   need == VRSQ_POS_SEPARATE ? VRTAC_R_SEPARATION : VRTAC_R_SLOT_FAR ) ) {
 			merc.nextFormationAt = now + VRTAC_FORM_COOLDOWN_MS;
-			VrTac_Log( 1, "merc_formation_changed", "reason=%s side=%d travel=%d", reason == VRTAC_REPOS_TOO_CLOSE ? "too_close" : "in_front",
-					   side, nav );
+			VrTac_Log( 1, "merc_formation_changed", "role=%d trigger=%s narrow=%d travel=%d squad=%d", role, trigger, sq.narrow, nav,
+					   VrSquad_CountBits( live ) );
 		}
 		return;
 	}
 	merc.nextFormationAt = now + VRTAC_FORM_COOLDOWN_MS;      // no usable slot: stay put, do not retry every tick
 }
-
 /*
 ===============
 VrMerc_SetOrder
@@ -1296,6 +1467,12 @@ static void VrMerc_SetOrder( gentity_t *player, gentity_t *ent, int order, qbool
 
 	// an explicit order replaces any running maneuver (the order below re-points the AI)
 	VrMerc_ManeuverEnd( player, cs, VRTAC_R_ORDER_CHANGED, qfalse );
+	merc.moveForced = 0;                    // the new order re-points the AI; the follow policy starts over
+	if ( merc.slot >= 0 && merc.slot < MAX_CLIENTS ) {
+		mercMoveMode[merc.slot] = VRMOVE_NEAR;
+	}
+	merc.move.mode = VRMOVE_NEAR;
+	merc.move.since = level.time;
 	VrTac_Log( 1, "order", "cmd=%s", order == VRMERC_ORDER_HOLD ? "hold" : "follow" );
 	merc.order = order;
 	merc.returnAllowedAt = 0;       // an explicit command ends any return cooldown
@@ -1307,14 +1484,14 @@ static void VrMerc_SetOrder( gentity_t *player, gentity_t *ent, int order, qbool
 		VrMerc_SetState( VRMERC_HOLD, VRTAC_R_COMMAND );
 		VrMerc_Sound( ent, STAYSOUNDSCRIPT );
 		if ( announce ) {
-			VrMerc_Message( "Mercenary: holding position" );
+			VrMerc_Say( "Mercenary: holding position" );
 		}
 	} else {
 		VrMerc_ApplyFollow( player, cs );
 		VrMerc_SetState( VRMERC_FOLLOW, VRTAC_R_COMMAND );
 		VrMerc_Sound( ent, FOLLOWSOUNDSCRIPT );
 		if ( announce ) {
-			VrMerc_Message( "Mercenary: following you" );
+			VrMerc_Say( "Mercenary: following you" );
 		}
 	}
 	merc.stateChanges++;
@@ -1330,23 +1507,24 @@ Replaces the stock use-key handler: looking at the mercenary and pressing
 */
 static void VrMerc_Activate( int entNum, int activatorNum ) {
 	gentity_t *player = VrMerc_Player();
-	gentity_t *ent = VrMerc_Entity();
+	vrMerc_t *m = VrMerc_ForEntity( entNum ), *saved = mcur;
+	gentity_t *ent;
 	cast_state_t *cs;
 
-	if ( !player || !ent || ent->s.number != entNum || activatorNum != player->s.number ) {
+	if ( !player || !m || activatorNum != player->s.number ) {
 		return;
 	}
-	if ( !VrMerc_StateIsActive( merc.state ) ) {
-		return;
+	mcur = m;               // this callback comes from the engine: work on the soldier that was used
+	ent = VrMerc_Entity();
+	if ( ent && ent->s.number == entNum && VrMerc_StateIsActive( merc.state ) ) {
+		cs = AICast_GetCastState( entNum );
+		if ( cs->lastActivate <= level.time - 1000 ) {
+			cs->lastActivate = level.time;
+			VrMerc_SetOrder( player, ent, merc.order == VRMERC_ORDER_FOLLOW ? VRMERC_ORDER_HOLD : VRMERC_ORDER_FOLLOW, qtrue );
+		}
 	}
-	cs = AICast_GetCastState( entNum );
-	if ( cs->lastActivate > level.time - 1000 ) {
-		return;
-	}
-	cs->lastActivate = level.time;
-	VrMerc_SetOrder( player, ent, merc.order == VRMERC_ORDER_FOLLOW ? VRMERC_ORDER_HOLD : VRMERC_ORDER_FOLLOW, qtrue );
+	mcur = saved;
 }
-
 /*
 ===============
 VrMerc_Finish
@@ -1374,7 +1552,6 @@ static void VrMerc_Finish( int terminalState ) {
 	merc.moveForced = 0;
 	merc.target = -1;
 	merc.designated = -1;
-	merc.designateArmedUntil = 0;
 	merc.coverMeUntil = 0;
 	VrMerc_Log( 1, terminalState == VRMERC_DEAD ? "merc_died" : "merc_dismissed", "reason=%s", terminalState == VRMERC_DEAD ? "dead" : "dismissed" );
 
@@ -1386,13 +1563,16 @@ static void VrMerc_Finish( int terminalState ) {
 		trap_DropClient( ent->s.number, "" );
 	}
 
+	VrMerc_Say( terminalState == VRMERC_DEAD ? "Mercenary: killed in action" : "Mercenary: dismissed" );   // while still counted
+	if ( vr_merc_sel.integer == merc.id ) {
+		trap_Cvar_Set( "vr_merc_sel", "0" );        // the soldier the notebook addressed is gone: address all again
+	}
 	VrMerc_SetState( terminalState, terminalState == VRMERC_DEAD ? VRTAC_R_DEAD : VRTAC_R_DISMISSED );
-	merc.slot = -1;
+	merc.slot = -1;                         // the record is free again (it keeps the terminal state for "merc status")
 	merc.dismissRequested = qfalse;
 	merc.stateChanges++;
-	trap_Cvar_Set( "vr_merc", "0" );        // no automatic re-hire after death or dismissal
-
-	VrMerc_Message( terminalState == VRMERC_DEAD ? "Mercenary: killed in action" : "Mercenary: dismissed" );
+	// the wish is the number of soldiers that stay: no automatic re-hire of the one that is gone
+	trap_Cvar_Set( "vr_merc", va( "%d", VrMerc_LiveCount() ) );
 }
 
 /*
@@ -1405,8 +1585,22 @@ static qboolean VrMerc_FindSpawnPos( gentity_t *player, vec3_t outPos ) {
 	int playerArea;
 	float yaw = player->client->ps.viewangles[YAW];
 	vec3_t origin;
+	vec3_t matePos[VRMERC_MAX_SQUAD];
+	int nMates = 0;
 
 	VectorCopy( player->client->ps.origin, origin );
+
+	// positions of the soldiers that are already in the squad: a recruit never appears on top of one
+	{
+		int m;
+
+		for ( m = 0; m < VRMERC_MAX_SQUAD; m++ ) {
+			if ( squad[m].slot >= 0 && nMates < VRMERC_MAX_SQUAD ) {
+				VectorCopy( g_entities[squad[m].slot].r.currentOrigin, matePos[nMates] );
+				nMates++;
+			}
+		}
+	}
 
 	trap_AAS_SetCurrentWorld( AASWORLD_STANDARD );
 	playerArea = trap_AAS_PointAreaNum( origin );
@@ -1452,6 +1646,9 @@ static qboolean VrMerc_FindSpawnPos( gentity_t *player, vec3_t outPos ) {
 		if ( tr.startsolid || tr.allsolid ) {
 			continue;
 		}
+		if ( !VrSquad_SpawnClear( pos, &matePos[0][0], nMates ) ) {
+			continue;       // too close to a squad mate
+		}
 
 		// 4. not in water, lava, slime or a no-drop volume
 		VectorCopy( pos, feet );
@@ -1493,17 +1690,17 @@ static qboolean VrMerc_RequestSpawn( gentity_t *player, vec3_t pos ) {
 		return qfalse;
 	}
 	merc.chosen = pick;
-	merc.character = merc.cand[pick].aiChar;
+	merc.character = sq.cand[pick].aiChar;
 	spawn->classname = ( merc.character == AICHAR_PARTISAN ) ? "ai_partisan" :
 					   ( merc.character == AICHAR_SOLDIER ) ? "ai_soldier" :
 					   ( merc.character == AICHAR_ELITEGUARD ) ? "ai_eliteguard" : "ai_american";
 	spawn->aiCharacter = merc.character;
 	spawn->aiTeam = AITEAM_ALLIES;
-	spawn->aiName = VRMERC_AINAME;
+	spawn->aiName = (char *)VrSquad_AiName( merc.id - 1 );      // unique per soldier (static string)
 	// visual identity: discovered model and skins; faction stays allied (aiTeam above)
 	// (static buffers: AIChar_spawn reads them a few frames later and only one request is pending)
-	Com_sprintf( mercSpawnSkin, sizeof( mercSpawnSkin ), "%s/%s", merc.cand[pick].model, merc.cand[pick].bodySkin );
-	Q_strncpyz( mercSpawnHead, merc.cand[pick].headSkin, sizeof( mercSpawnHead ) );
+	Com_sprintf( mercSpawnSkin, sizeof( mercSpawnSkin ), "%s/%s", sq.cand[pick].model, sq.cand[pick].bodySkin );
+	Q_strncpyz( mercSpawnHead, sq.cand[pick].headSkin, sizeof( mercSpawnHead ) );
 	spawn->aiSkin = mercSpawnSkin;
 	spawn->aihSkin = mercSpawnHead;
 	VectorCopy( pos, spawn->s.origin );
@@ -1518,53 +1715,57 @@ static qboolean VrMerc_RequestSpawn( gentity_t *player, vec3_t pos ) {
 	spawn->think = AIChar_spawn;
 	spawn->nextthink = level.time + FRAMETIME * 4;
 
-	merc.spawnPending = qtrue;
-	merc.spawnStart = level.time;
-	merc.spawnEntity = spawn->s.number;
+	sq.spawnPending = qtrue;
+	sq.pendingIdx = merc.id - 1;
+	sq.spawnStart = level.time;
+	sq.spawnEntity = spawn->s.number;
 	merc.dismissRequested = qfalse;
 	G_Printf( "VR mercenary: spawning %s behaviour with model %s skin %s head %s\n",
-			  aiDefaults[merc.character].name, merc.cand[pick].model, merc.cand[pick].bodySkin,
-			  merc.cand[pick].headSkin );
+			  aiDefaults[merc.character].name, sq.cand[pick].model, sq.cand[pick].bodySkin,
+			  sq.cand[pick].headSkin );
 	return qtrue;
 }
 
 static void VrMerc_CancelSpawn( void ) {
-	if ( merc.spawnEntity >= 0 ) {
-		gentity_t *spawn = &g_entities[merc.spawnEntity];
+	if ( sq.spawnEntity >= 0 ) {
+		gentity_t *spawn = &g_entities[sq.spawnEntity];
 
 		// only free it if it is still our unconsumed spawn request
-		if ( spawn->inuse && spawn->think == AIChar_spawn && spawn->aiName && !strcmp( spawn->aiName, VRMERC_AINAME ) ) {
+		if ( spawn->inuse && spawn->think == AIChar_spawn && VrSquad_IdxFromName( spawn->aiName ) >= 0 ) {
 			G_FreeEntity( spawn );
 		}
 	}
-	merc.spawnEntity = -1;
-	merc.spawnPending = qfalse;
+	sq.spawnEntity = -1;
+	sq.spawnPending = qfalse;
+	sq.pendingIdx = -1;
 }
 
 static gentity_t *VrMerc_FindNewCompanion( void ) {
 	int i;
+	const char *name = VrSquad_AiName( merc.id - 1 );
 
+	// the character that carries THIS recruit's unique name and is not yet in the squad
 	for ( i = 1; i < level.maxclients; i++ ) {
 		gentity_t *ent = &g_entities[i];
 
-		if ( VrMerc_IsCompanion( ent ) && ent->health > 0 ) {
+		if ( VrMerc_IsCompanion( ent ) && ent->health > 0 && !strcmp( ent->aiName, name ) && !VrMerc_ForEntity( i ) ) {
 			return ent;
 		}
 	}
 	return NULL;
 }
-
 static void VrMerc_Adopt( gentity_t *player, gentity_t *ent ) {
 	cast_state_t *cs = AICast_GetCastState( ent->s.number );
 
-	merc.spawnPending = qfalse;
-	merc.spawnEntity = -1;
-	merc.spawnAttempts = 0;
+	sq.spawnPending = qfalse;
+	sq.pendingIdx = -1;
+	sq.spawnEntity = -1;
+	sq.spawnAttempts = 0;
 	merc.slot = ent->s.number;
+	merc.nextThink = level.time + ( merc.id - 1 ) * 30;      // stagger the soldiers' ticks
 	merc.lastTargetTime = level.time;
 	merc.target = -1;
 	merc.designated = -1;
-	merc.id = 1;
 	VrMove_Reset( &merc.move, level.time );
 	VrRecover_Reset( &merc.rec, ent->r.currentOrigin, level.time );
 	VrTrail_Reset( &merc.trail );
@@ -1578,14 +1779,14 @@ static void VrMerc_Adopt( gentity_t *player, gentity_t *ent ) {
 	merc.man.goalEnt = -1;
 	VrTac_DmgReset( &merc.dmgSelf );
 	VrTac_DmgReset( &merc.dmgPlayer );
-	VrMerc_Log( 1, "merc_hired", "ent=%d character=%s stance=%s", ent->s.number, aiDefaults[merc.character].name,
+	VrMerc_Log( 1, "merc_hired", "ent=%d name=%s squad=%d character=%s stance=%s", ent->s.number, ent->aiName, VrMerc_LiveCount(), aiDefaults[merc.character].name,
 			   merc.stance == VRTAC_STANCE_AGGRESSIVE ? "aggressive" : "defensive" );
 	cs->activate = VrMerc_Activate;
 	VrMerc_SetPassive( cs, vr_merc_assist.integer == 0 );
 
 	// start in the current standing order
 	VrMerc_SetOrder( player, ent, merc.order, qfalse );
-	VrMerc_Message( "Mercenary: hired" );
+	VrMerc_Say( "Mercenary: hired" );
 }
 
 static void VrMerc_PollSpawn( gentity_t *player ) {
@@ -1595,10 +1796,10 @@ static void VrMerc_PollSpawn( gentity_t *player ) {
 		VrMerc_Adopt( player, ent );
 		return;
 	}
-	if ( level.time - merc.spawnStart > VRMERC_SPAWN_TIMEOUT_MS ) {
+	if ( level.time - sq.spawnStart > VRMERC_SPAWN_TIMEOUT_MS ) {
 		VrMerc_CancelSpawn();
-		merc.nextSpawnAttempt = level.time + VRMERC_SPAWN_RETRY_MS;
-		G_Printf( "VR mercenary: spawn timed out (attempt %d)\n", merc.spawnAttempts );
+		sq.nextSpawnAttempt = level.time + VRMERC_SPAWN_RETRY_MS;
+		G_Printf( "VR mercenary: spawn timed out (attempt %d)\n", sq.spawnAttempts );
 	}
 }
 
@@ -1613,7 +1814,8 @@ Returns a vrMercHireResult_t.
 static int VrMerc_TryHire( gentity_t *player ) {
 	vrMercHireContext_t ctx;
 	vec3_t pos;
-	int result;
+	int result, i, idx, used[VRMERC_MAX_SQUAD];
+	vrMerc_t *saved = mcur;
 	gentity_t *orphan;
 
 	VrMerc_BuildHireContext( player, &ctx );
@@ -1621,23 +1823,32 @@ static int VrMerc_TryHire( gentity_t *player ) {
 	if ( result != VRMERC_HIRE_OK ) {
 		return result;
 	}
+	for ( i = 0; i < VRMERC_MAX_SQUAD; i++ ) {
+		used[i] = ( squad[i].slot >= 0 );
+	}
+	idx = VrSquad_PickFreeInstance( used, VRMERC_MAX_SQUAD );
+	if ( idx < 0 ) {
+		return VRMERC_HIRE_ALREADY_ACTIVE;
+	}
+	VrMerc_InstInit( idx );                 // a fresh record with its own identity
+	mcur = &squad[idx];
+	result = VRMERC_HIRE_OK;
+
 	// a character from an earlier request that finished after we gave up on it: take it over
 	// instead of creating a second one
 	orphan = VrMerc_FindNewCompanion();
 	if ( orphan ) {
 		VrMerc_Adopt( player, orphan );
-		return VRMERC_HIRE_OK;
+	} else if ( !VrMerc_FindSpawnPos( player, pos ) ) {
+		result = VRMERC_HIRE_NO_SPAWN_POINT;
+	} else if ( !VrMerc_RequestSpawn( player, pos ) ) {
+		result = VRMERC_HIRE_NO_MODEL;
+	} else {
+		sq.spawnAttempts++;
 	}
-	if ( !VrMerc_FindSpawnPos( player, pos ) ) {
-		return VRMERC_HIRE_NO_SPAWN_POINT;
-	}
-	if ( !VrMerc_RequestSpawn( player, pos ) ) {
-		return VRMERC_HIRE_NO_MODEL;
-	}
-	merc.spawnAttempts++;
-	return VRMERC_HIRE_OK;
+	mcur = saved;
+	return result;
 }
-
 /*
 ===============
 M4 tactical layer, part 2: cover, flank, regroup / retreat.
@@ -1753,6 +1964,13 @@ static qboolean VrMerc_TryCover( gentity_t *player, gentity_t *ent, cast_state_t
 	w.healthFrac = mtx.healthFrac;
 	w.cooldownOk = ( now >= merc.coverCooldownUntil ) ? 1 : 0;
 	w.maneuverActive = ( merc.man.kind != MAN_NONE ) ? 1 : 0;
+	w.outOfAmmo = AICast_GotEnoughAmmoForWeapon( cs, cs->weaponNum ) ? 0 : 1;
+	{
+		int h, tot;
+
+		VrTac_DmgWindow( &merc.dmgSelf, now, 4000, &h, &tot );
+		w.recentDamage = ( h >= 1 ) ? 1 : 0;
+	}
 	if ( !VrTac_WantCover( &w, &reason ) || now < merc.nextCoverSearch ) {
 		return qfalse;
 	}
@@ -2014,7 +2232,7 @@ static qboolean VrMerc_StartRegroup( gentity_t *player, gentity_t *ent, cast_sta
 		// (otherwise it would walk straight back into the fire that made it retreat)
 		VrMerc_FreeHoldGoal( cs );
 		merc.order = VRMERC_ORDER_FOLLOW;
-		VrMerc_Message( "Mercenary: falling back to you" );
+		VrMerc_Say( "Mercenary: falling back to you" );
 	}
 	cs->followEntity = -1;
 	cs->leaderNum = player->s.number;
@@ -2513,26 +2731,59 @@ Called once per level load (the game module state is reset on every map load).
 ===============
 */
 void VrMerc_Init( void ) {
-	memset( &merc, 0, sizeof( merc ) );
-	merc.state = VRMERC_NONE;
-	merc.order = VRMERC_ORDER_FOLLOW;
-	merc.slot = -1;
-	merc.holdGoal = -1;
-	merc.spawnEntity = -1;
-	merc.levelStart = level.time;
-	// tactical layer: no stale entity references may survive a level change or load
-	merc.target = -1;
-	merc.designated = -1;
-	merc.hurtSelfBy = merc.hurtPlayerBy = -1;
-	merc.man.kind = MAN_NONE;
-	merc.man.goalEnt = -1;
-	merc.stance = vr_merc_stance.integer ? VRTAC_STANCE_AGGRESSIVE : VRTAC_STANCE_DEFENSIVE;
-	VrTac_DmgReset( &merc.dmgSelf );
-	VrTac_DmgReset( &merc.dmgPlayer );
-	merc.id = 1;
-	VrMove_Reset( &merc.move, level.time );
+	int i;
+
+	memset( &sq, 0, sizeof( sq ) );
+	sq.pendingIdx = -1;
+	sq.spawnEntity = -1;
+	sq.levelStart = level.time;
+	// no soldier record, goal entity or entity number may survive a level change or a load
+	for ( i = 0; i < VRMERC_MAX_SQUAD; i++ ) {
+		VrMerc_InstInit( i );
+	}
+	mcur = &squad[0];
 	memset( mercMoveMode, 0, sizeof( mercMoveMode ) );
 	tacLogWindowStart = tacLogCount = tacLogDropped = 0;
+}
+/*
+===============
+Squad sensing (once per second, for the whole squad): is the player standing still, and is the
+player in a corridor or doorway (then the formation becomes single file)?
+===============
+*/
+static void VrMerc_SquadSense( gentity_t *player ) {
+	int now = level.time;
+	float speed = sqrtf( player->client->ps.velocity[0] * player->client->ps.velocity[0] +
+						 player->client->ps.velocity[1] * player->client->ps.velocity[1] );
+
+	if ( speed < 40.0f ) {
+		if ( !sq.playerStillSince ) {
+			sq.playerStillSince = now;
+		}
+	} else {
+		sq.playerStillSince = 0;
+	}
+	if ( now >= sq.nextNarrowCheck ) {
+		vec3_t o, l, r, right, fwd, up;
+		trace_t tl, tr;
+		float width;
+		int narrow;
+
+		sq.nextNarrowCheck = now + 1000;
+		AngleVectors( player->client->ps.viewangles, fwd, right, up );
+		VectorCopy( player->r.currentOrigin, o );
+		VectorMA( o, -120, right, l );
+		VectorMA( o, 120, right, r );
+		trap_Trace( &tl, o, NULL, NULL, l, player->s.number, MASK_PLAYERSOLID );
+		trap_Trace( &tr, o, NULL, NULL, r, player->s.number, MASK_PLAYERSOLID );
+		width = tl.fraction * 120.0f + tr.fraction * 120.0f;
+		// hysteresis: narrow below 220 units, wide again only when both sides are clear
+		narrow = sq.narrow ? ( width < 235.0f ) : VrSquad_IsNarrow( tl.fraction * 120.0f, tr.fraction * 120.0f );
+		if ( narrow != sq.narrow ) {
+			sq.narrow = narrow;
+			VrSquad_Log( 1, "merc_formation_changed", "narrow=%d width=%.0f squad=%d", narrow, width, VrMerc_LiveCount() );
+		}
+	}
 }
 
 /*
@@ -2545,76 +2796,116 @@ companion exists, a spawn is pending or the player asked for one.
 */
 void VrMerc_Frame( void ) {
 	gentity_t *player;
+	int i, live, wanted, now = level.time;
 
 	if ( g_gametype.integer != GT_SINGLE_PLAYER ) {
 		return;
 	}
-	if ( merc.slot < 0 && !merc.spawnPending && !vr_merc.integer ) {
+	live = VrMerc_LiveMask();
+	if ( !live && !sq.spawnPending && vr_merc.integer <= 0 ) {
 		return;     // fast path: nothing to do
 	}
 	player = VrMerc_Player();
 
 	// armed "attack my target": the player's next fire press designates what the weapon points at
-	if ( player && merc.designateArmedUntil ) {
-		gentity_t *comp = VrMerc_Entity();
+	if ( player && sq.designateArmedUntil ) {
 		int pressed = ( player->client->pers.cmd.buttons & BUTTON_ATTACK ) ? 1 : 0;
+		int addressed = sq.designateMask & live;
 
-		if ( !comp || level.time >= merc.designateArmedUntil ) {
-			merc.designateArmedUntil = 0;
-			VrTac_Log( 1, "designate_disarmed", "reason=%s", comp ? "timeout" : "no_companion" );
-		} else if ( pressed && !merc.lastAttackButton ) {
-			VrMerc_Designate( player, comp );
+		if ( !addressed || now >= sq.designateArmedUntil ) {
+			sq.designateArmedUntil = 0;
+			VrSquad_Log( 1, "designate_disarmed", "reason=%s", addressed ? "timeout" : "no_companion" );
+		} else if ( pressed && !sq.lastAttackButton ) {
+			VrMerc_Designate( player, addressed );
 		}
-		merc.lastAttackButton = pressed;
+		sq.lastAttackButton = pressed;
 	}
-
-	if ( level.time < merc.nextThink ) {
-		return;
-	}
-	merc.nextThink = level.time + VRMERC_THINK_MS;
-
 	if ( !player ) {
 		return;
 	}
 
-	if ( merc.spawnPending ) {
+	// a recruit on the way
+	if ( sq.spawnPending && now >= sq.nextPoll && sq.pendingIdx >= 0 ) {
+		sq.nextPoll = now + VRMERC_THINK_MS;
+		mcur = &squad[sq.pendingIdx];
 		VrMerc_PollSpawn( player );
-	} else if ( merc.slot >= 0 ) {
+		mcur = &squad[0];
+	}
+
+	// every soldier thinks on its own schedule (staggered), independently of the others
+	if ( live ) {
+		VrMerc_SquadSense( player );
+	}
+	for ( i = 0; i < VRMERC_MAX_SQUAD; i++ ) {
+		if ( squad[i].slot < 0 || now < squad[i].nextThink ) {
+			continue;
+		}
+		mcur = &squad[i];
+		merc.nextThink = now + VRMERC_THINK_MS;
 		VrMerc_Supervise( player );
-	} else if ( vr_merc.integer && merc.state != VRMERC_DEAD && merc.state != VRMERC_DISMISSED ) {
-		// automatic (re-)hire after a level change or a load
+	}
+	mcur = &squad[0];
+
+	// automatic (re-)hire after a level change or a load: up to the remembered number of soldiers,
+	// one recruit at a time, with the M3 retry/limit policy
+	wanted = vr_merc.integer < VrMerc_SquadLimit() ? vr_merc.integer : VrMerc_SquadLimit();
+	if ( !sq.spawnPending && VrMerc_LiveCount() < wanted && now >= sq.nextPoll ) {
 		vrMercHireContext_t ctx;
 		int result;
 
 		VrMerc_BuildHireContext( player, &ctx );
 		result = VrMerc_CanHire( &ctx );
-		if ( VrMerc_ShouldAutoSpawn( 1, result, merc.spawnAttempts, level.time,
-									 merc.nextSpawnAttempt, level.time - merc.levelStart ) ) {
+		if ( VrMerc_ShouldAutoSpawn( 1, result, sq.spawnAttempts, now, sq.nextSpawnAttempt, now - sq.levelStart ) ) {
 			result = VrMerc_TryHire( player );
-			merc.nextSpawnAttempt = level.time + VRMERC_SPAWN_RETRY_MS;
+			sq.nextSpawnAttempt = now + VRMERC_SPAWN_RETRY_MS;
 			if ( result != VRMERC_HIRE_OK ) {
-				merc.spawnAttempts++;
-				if ( merc.spawnAttempts >= VRMERC_SPAWN_MAX_ATTEMPTS ) {
+				sq.spawnAttempts++;
+				if ( sq.spawnAttempts >= VRMERC_SPAWN_MAX_ATTEMPTS ) {
 					VrMerc_Message( VrMerc_HireReasonText( result ) );
 				}
 			}
 		}
 	}
 }
+/*
+===============
+Command helpers
+===============
+*/
+// Which soldiers does a command address?  Explicit "all" / 1..4 first, then the notebook selector.
+static qboolean VrMerc_Select( const char *arg, int *mask ) {
+	switch ( VrSquad_ResolveSelection( arg, vr_merc_sel.integer, VrMerc_LiveMask(), mask ) ) {
+	case VRSQ_SEL_OK:
+		return qtrue;
+	case VRSQ_SEL_BAD_ARG:
+		VrMerc_Message( "Mercenary: use all or a number from 1 to 4" );
+		break;
+	case VRSQ_SEL_NO_SUCH:
+		VrMerc_Message( "Mercenary: no such soldier in your squad" );
+		break;
+	default:
+		VrMerc_Message( "Mercenary: not hired yet" );
+		break;
+	}
+	return qfalse;
+}
 
 /*
 ===============
 VrMerc_ClientCommand
 
-  merc hire | follow | hold | assist [0|1] | type [model|auto] | models | dismiss | status
+  merc hire | dismiss [all|N] | follow [all|N] | hold [all|N] | regroup [all|N] | cover [all|N]
+        attack [now] [all|N] | stance [defensive|aggressive] | assist [0|1] | select [all|N]
+        type [model|auto] | models | status
 ===============
 */
 void VrMerc_ClientCommand( gentity_t *ent ) {
 	char sub[MAX_QPATH];
 	char arg[MAX_QPATH];
+	char arg2[MAX_QPATH];
 	gentity_t *player = VrMerc_Player();
-	gentity_t *comp;
-	int result;
+	int result, i, mask, live;
+	vrMerc_t *saved = mcur;
 
 	// local single-player human only
 	if ( g_gametype.integer != GT_SINGLE_PLAYER || !player || ent != player ) {
@@ -2622,46 +2913,71 @@ void VrMerc_ClientCommand( gentity_t *ent ) {
 	}
 
 	trap_Argv( 1, sub, sizeof( sub ) );
-	comp = VrMerc_Entity();
+	trap_Argv( 2, arg, sizeof( arg ) );
+	trap_Argv( 3, arg2, sizeof( arg2 ) );
+	live = VrMerc_LiveCount();
 
 	if ( !Q_stricmp( sub, "hire" ) ) {
-		// (re)start from a clean slate: a previous death or dismissal does not block a new hire
-		if ( comp || merc.spawnPending ) {
-			VrMerc_Message( VrMerc_HireReasonText( comp ? VRMERC_HIRE_ALREADY_ACTIVE : VRMERC_HIRE_SPAWN_PENDING ) );
+		int limit = VrMerc_SquadLimit(), can = VrSquad_CanAdd( live, sq.spawnPending ? 1 : 0, limit );
+
+		if ( can == VRSQ_PENDING ) {
+			VrMerc_Message( VrMerc_HireReasonText( VRMERC_HIRE_SPAWN_PENDING ) );
 			return;
 		}
-		merc.state = VRMERC_NONE;
-		merc.order = VRMERC_ORDER_FOLLOW;
+		if ( can != VRSQ_OK ) {
+			// a clear refusal, never a silent failure
+			VrSquad_Log( 1, "merc_limit_reached", "squad=%d limit=%d reason=%s", live, limit, VrTac_ReasonName( VRTAC_R_SQUAD_FULL ) );
+			VrMerc_Message( va( "Mercenary: squad is full (%d of %d)", live, limit ) );
+			return;
+		}
 		result = VrMerc_TryHire( player );
 		if ( result != VRMERC_HIRE_OK ) {
+			if ( result == VRMERC_HIRE_NO_CLIENT_SLOT ) {
+				VrSquad_Log( 1, "merc_limit_reached", "squad=%d limit=%d reason=%s", live, limit, VrTac_ReasonName( VRTAC_R_NO_SLOT ) );
+			}
 			VrMerc_Message( VrMerc_HireReasonText( result ) );
 			return;
 		}
-		VrTac_Log( 1, "order", "cmd=hire" );
-		trap_Cvar_Set( "vr_merc", "1" );        // remember the wish across level changes and loads
-		merc.nextThink = 0;
+		VrSquad_Log( 1, "order", "cmd=hire squad=%d limit=%d", live, limit );
+		// remember the wish (the number of soldiers) across level changes and loads
+		trap_Cvar_Set( "vr_merc", va( "%d", VrMerc_LiveCount() + 1 ) );
 	} else if ( !Q_stricmp( sub, "dismiss" ) ) {
-		if ( merc.spawnPending ) {
+		if ( sq.spawnPending ) {
 			VrMerc_CancelSpawn();
-			trap_Cvar_Set( "vr_merc", "0" );
+			trap_Cvar_Set( "vr_merc", va( "%d", live ) );
 			VrMerc_Message( "Mercenary: cancelled" );
-		} else if ( comp ) {
-			VrTac_Log( 1, "order", "cmd=dismiss" );
-			merc.dismissRequested = qtrue;
-			merc.nextThink = 0;
-		} else {
+		} else if ( VrMerc_Select( arg, &mask ) ) {
+			for ( i = 0; i < VRMERC_MAX_SQUAD; i++ ) {
+				if ( mask & ( 1 << i ) ) {
+					mcur = &squad[i];
+					VrTac_Log( 1, "order", "cmd=dismiss" );
+					merc.dismissRequested = qtrue;
+					merc.nextThink = 0;
+				}
+			}
+			mcur = saved;
+		} else if ( live == 0 ) {
 			trap_Cvar_Set( "vr_merc", "0" );
-			VrMerc_Message( "Mercenary: nobody to dismiss" );
 		}
 	} else if ( !Q_stricmp( sub, "follow" ) || !Q_stricmp( sub, "hold" ) ) {
 		int order = !Q_stricmp( sub, "hold" ) ? VRMERC_ORDER_HOLD : VRMERC_ORDER_FOLLOW;
 
-		if ( !comp ) {
-			merc.order = order;     // applies when the companion arrives
-			VrMerc_Message( "Mercenary: not hired yet" );
+		if ( !VrMerc_Select( arg, &mask ) ) {
 			return;
 		}
-		VrMerc_SetOrder( player, comp, order, qtrue );
+		for ( i = 0; i < VRMERC_MAX_SQUAD; i++ ) {
+			gentity_t *comp;
+
+			if ( !( mask & ( 1 << i ) ) ) {
+				continue;
+			}
+			mcur = &squad[i];
+			comp = VrMerc_Entity();
+			if ( comp ) {
+				VrMerc_SetOrder( player, comp, order, qtrue );
+			}
+		}
+		mcur = saved;
 	} else if ( !Q_stricmp( sub, "type" ) ) {
 		trap_Argv( 2, arg, sizeof( arg ) );
 		VrMerc_ProbeModels();
@@ -2677,13 +2993,13 @@ void VrMerc_ClientCommand( gentity_t *ent ) {
 			int i, curIdx = -1, nextIdx = -1;
 
 			trap_Cvar_VariableStringBuffer( "vr_merc_model", cur, sizeof( cur ) );
-			for ( i = 0; i < merc.numCand; i++ ) {
-				if ( cur[0] && VrMerc_StrEqNoCase( merc.cand[i].model, cur ) ) {
+			for ( i = 0; i < sq.numCand; i++ ) {
+				if ( cur[0] && VrMerc_StrEqNoCase( sq.cand[i].model, cur ) ) {
 					curIdx = i;
 				}
 			}
-			for ( i = curIdx + 1; i < merc.numCand; i++ ) {
-				if ( merc.cand[i].problem == VRMERC_MODEL_OK ) {
+			for ( i = curIdx + 1; i < sq.numCand; i++ ) {
+				if ( sq.cand[i].problem == VRMERC_MODEL_OK ) {
 					nextIdx = i;
 					break;
 				}
@@ -2692,8 +3008,8 @@ void VrMerc_ClientCommand( gentity_t *ent ) {
 				trap_Cvar_Set( "vr_merc_model", "" );
 				VrMerc_Message( "Mercenary model: automatic" );
 			} else {
-				trap_Cvar_Set( "vr_merc_model", merc.cand[nextIdx].model );
-				VrMerc_Message( va( "Mercenary model: %s", merc.cand[nextIdx].model ) );
+				trap_Cvar_Set( "vr_merc_model", sq.cand[nextIdx].model );
+				VrMerc_Message( va( "Mercenary model: %s", sq.cand[nextIdx].model ) );
 			}
 		}
 	} else if ( !Q_stricmp( sub, "models" ) ) {
@@ -2702,10 +3018,10 @@ void VrMerc_ClientCommand( gentity_t *ent ) {
 		int i, n, pick = VrMerc_PickModel();
 		char *d;
 
-		for ( i = 0; i < merc.numCand; i++ ) {
-			G_Printf( "VR mercenary: candidate %d: %s/%s model %s: %s%s%s\n", i, aiDefaults[merc.cand[i].aiChar].name,
-					  merc.cand[i].model, merc.cand[i].bodySkin, VrMerc_ModelProblemText( merc.cand[i].problem ),
-					  merc.cand[i].missing[0] ? " - missing: " : "", merc.cand[i].missing );
+		for ( i = 0; i < sq.numCand; i++ ) {
+			G_Printf( "VR mercenary: candidate %d: %s/%s model %s: %s%s%s\n", i, aiDefaults[sq.cand[i].aiChar].name,
+					  sq.cand[i].model, sq.cand[i].bodySkin, VrMerc_ModelProblemText( sq.cand[i].problem ),
+					  sq.cand[i].missing[0] ? " - missing: " : "", sq.cand[i].missing );
 		}
 		n = trap_FS_GetFileList( "models/players", "/", dirBuf, sizeof( dirBuf ) );
 		for ( i = 0, d = dirBuf; i < n; i++, d += strlen( d ) + 1 ) {
@@ -2715,8 +3031,8 @@ void VrMerc_ClientCommand( gentity_t *ent ) {
 			if ( !strcmp( d, "." ) || !strcmp( d, ".." ) ) {
 				continue;
 			}
-			for ( k = 0; k < merc.numCand; k++ ) {
-				if ( VrMerc_StrEqNoCase( merc.cand[k].model, d ) ) {
+			for ( k = 0; k < sq.numCand; k++ ) {
+				if ( VrMerc_StrEqNoCase( sq.cand[k].model, d ) ) {
 					known = 1;
 				}
 			}
@@ -2727,44 +3043,79 @@ void VrMerc_ClientCommand( gentity_t *ent ) {
 			}
 		}
 		VrMerc_Message( pick < 0 ? "Mercenary: no usable soldier model (see log)" :
-					   va( "Mercenary model: %s", merc.cand[pick].model ) );
+					   va( "Mercenary model: %s", sq.cand[pick].model ) );
 	} else if ( !Q_stricmp( sub, "regroup" ) || !Q_stricmp( sub, "cover" ) ) {
 		qboolean cover = !Q_stricmp( sub, "cover" ) ? qtrue : qfalse;
-		vrTacOrderCtx_t octx = VrMerc_OrderContext( player );
-		cast_state_t *ccs;
-		float dist;
 
-		result = VrTac_ValidateCommand( cover ? VRTAC_CMD_COVER_ME : VRTAC_CMD_REGROUP, &octx );
-		if ( result != VRTAC_OK ) {
-			VrTac_Log( 1, "order_rejected", "cmd=%s reason=%s", cover ? "cover_me" : "regroup", VrTac_ReasonName( result ) );
-			VrMerc_Message( VrMerc_ReasonText( result ) );
+		if ( !VrMerc_Select( arg, &mask ) ) {
 			return;
 		}
-		ccs = AICast_GetCastState( comp->s.number );
-		if ( VrMerc_ScriptBusy( ccs ) ) {
-			VrTac_Log( 1, "order_rejected", "cmd=%s reason=%s", cover ? "cover_me" : "regroup", VrTac_ReasonName( VRTAC_R_SCRIPT ) );
-			VrMerc_Message( "Mercenary: busy right now" );
-			return;
-		}
-		VrTac_Log( 1, "order", "cmd=%s", cover ? "cover_me" : "regroup" );
-		if ( merc.order == VRMERC_ORDER_HOLD ) {
-			VrMerc_SetOrder( player, comp, VRMERC_ORDER_FOLLOW, qfalse );   // leaves the post, ends any maneuver
-		} else if ( !cover || merc.man.kind == MAN_FLANK ) {
-			VrMerc_CancelManeuver( player, comp, ccs, VRTAC_R_ORDER_CHANGED );
-		}
-		dist = Distance( comp->r.currentOrigin, player->r.currentOrigin );
-		if ( cover ) {
-			merc.coverMeUntil = level.time + VRTAC_COVER_ME_MS;
-			VrMerc_Message( "Mercenary: covering you" );
-		}
-		if ( dist > ( cover ? 400.0f : VRTAC_REGROUP_ARRIVE_DIST ) ) {
-			VrMerc_StartRegroup( player, comp, ccs, VRTAC_R_COMMAND );
-			if ( !cover ) {
-				VrMerc_Message( "Mercenary: regrouping" );
+		for ( i = 0; i < VRMERC_MAX_SQUAD; i++ ) {
+			gentity_t *comp;
+			cast_state_t *ccs;
+			vrTacOrderCtx_t octx;
+			float dist;
+
+			if ( !( mask & ( 1 << i ) ) ) {
+				continue;
 			}
-		} else if ( !cover ) {
-			VrMerc_Message( "Mercenary: already with you" );
+			mcur = &squad[i];
+			comp = VrMerc_Entity();
+			octx = VrMerc_OrderContext( player );
+			result = VrTac_ValidateCommand( cover ? VRTAC_CMD_COVER_ME : VRTAC_CMD_REGROUP, &octx );
+			if ( result != VRTAC_OK || !comp ) {
+				VrTac_Log( 1, "order_rejected", "cmd=%s reason=%s", cover ? "cover_me" : "regroup", VrTac_ReasonName( result ) );
+				VrMerc_Say( VrMerc_ReasonText( result ) );
+				continue;
+			}
+			ccs = AICast_GetCastState( comp->s.number );
+			if ( VrMerc_ScriptBusy( ccs ) ) {
+				VrTac_Log( 1, "order_rejected", "cmd=%s reason=%s", cover ? "cover_me" : "regroup", VrTac_ReasonName( VRTAC_R_SCRIPT ) );
+				VrMerc_Say( "Mercenary: busy right now" );
+				continue;
+			}
+			VrTac_Log( 1, "order", "cmd=%s", cover ? "cover_me" : "regroup" );
+			if ( merc.order == VRMERC_ORDER_HOLD ) {
+				VrMerc_SetOrder( player, comp, VRMERC_ORDER_FOLLOW, qfalse );   // leaves the post, ends any maneuver
+			} else if ( !cover || merc.man.kind == MAN_FLANK ) {
+				VrMerc_CancelManeuver( player, comp, ccs, VRTAC_R_ORDER_CHANGED );
+			}
+			dist = Distance( comp->r.currentOrigin, player->r.currentOrigin );
+			if ( cover ) {
+				merc.coverMeUntil = level.time + VRTAC_COVER_ME_MS;
+				VrMerc_Say( "Mercenary: covering you" );
+			}
+			if ( dist > ( cover ? 400.0f : VRTAC_REGROUP_ARRIVE_DIST ) ) {
+				VrMerc_StartRegroup( player, comp, ccs, VRTAC_R_COMMAND );
+				if ( !cover ) {
+					VrMerc_Say( "Mercenary: regrouping" );
+				}
+			} else if ( !cover ) {
+				VrMerc_Say( "Mercenary: already with you" );
+			}
 		}
+		mcur = saved;
+	} else if ( !Q_stricmp( sub, "select" ) ) {
+		// notebook selector: no argument cycles all -> 1 -> 2 ... -> all over the soldiers that exist
+		int cur = vr_merc_sel.integer, next = 0, liveMask = VrMerc_LiveMask();
+
+		if ( arg[0] ) {
+			next = ( !Q_stricmp( arg, "all" ) ) ? 0 : atoi( arg );
+		} else {
+			for ( i = cur < 0 ? 0 : cur; i < VRMERC_MAX_SQUAD; i++ ) {
+				if ( liveMask & ( 1 << i ) ) {          // squad[i] has number i + 1 > cur
+					next = i + 1;
+					break;
+				}
+			}
+		}
+		if ( next < 0 || next > VRMERC_MAX_SQUAD || ( next && !( liveMask & ( 1 << ( next - 1 ) ) ) ) ) {
+			VrMerc_Message( "Mercenary: no such soldier in your squad" );
+			return;
+		}
+		trap_Cvar_Set( "vr_merc_sel", va( "%d", next ) );
+		VrSquad_Log( 1, "order", "cmd=select value=%d", next );
+		VrMerc_Message( next ? va( "Mercenary: addressing soldier %d", next ) : "Mercenary: addressing the whole squad" );
 	} else if ( !Q_stricmp( sub, "stance" ) ) {
 		int aggressive;
 
@@ -2781,46 +3132,79 @@ void VrMerc_ClientCommand( gentity_t *ent ) {
 		VrTac_Log( 1, "order", "cmd=stance value=%s", aggressive ? "aggressive" : "defensive" );
 		VrMerc_Message( aggressive ? "Mercenary: aggressive stance" : "Mercenary: defensive stance" );
 	} else if ( !Q_stricmp( sub, "attack" ) ) {
-		vrTacOrderCtx_t octx = VrMerc_OrderContext( player );
+		qboolean now = !Q_stricmp( arg, "now" ) ? qtrue : qfalse;
+		int okMask = 0;
 
-		result = VrTac_ValidateCommand( VRTAC_CMD_ATTACK, &octx );
-		if ( result != VRTAC_OK ) {
-			VrTac_Log( 1, "order_rejected", "cmd=attack reason=%s", VrTac_ReasonName( result ) );
-			VrMerc_Message( VrMerc_ReasonText( result ) );
+		if ( !VrMerc_Select( now ? arg2 : arg, &mask ) ) {
 			return;
 		}
-		trap_Argv( 2, arg, sizeof( arg ) );
-		if ( !Q_stricmp( arg, "now" ) ) {
-			VrMerc_Designate( player, comp );       // immediate: whatever the weapon points at
+		for ( i = 0; i < VRMERC_MAX_SQUAD; i++ ) {
+			vrTacOrderCtx_t octx;
+
+			if ( !( mask & ( 1 << i ) ) ) {
+				continue;
+			}
+			mcur = &squad[i];
+			octx = VrMerc_OrderContext( player );
+			result = VrTac_ValidateCommand( VRTAC_CMD_ATTACK, &octx );
+			if ( result != VRTAC_OK ) {
+				VrTac_Log( 1, "order_rejected", "cmd=attack reason=%s", VrTac_ReasonName( result ) );
+				VrMerc_Say( VrMerc_ReasonText( result ) );
+			} else {
+				okMask |= 1 << i;
+			}
+		}
+		mcur = saved;
+		if ( !okMask ) {
+			return;
+		}
+		if ( now ) {
+			VrMerc_Designate( player, okMask );     // immediate: whatever the weapon points at
 		} else {
 			// armed: the next fire press designates, so moving the controller alone never issues an order
-			merc.designateArmedUntil = level.time + VRTAC_DESIGNATE_ARM_MS;
-			merc.lastAttackButton = ( player->client->pers.cmd.buttons & BUTTON_ATTACK ) ? 1 : 0;
-			VrTac_Log( 1, "order", "cmd=attack armed_ms=%d", VRTAC_DESIGNATE_ARM_MS );
+			sq.designateMask = okMask;
+			sq.designateArmedUntil = level.time + VRTAC_DESIGNATE_ARM_MS;
+			sq.lastAttackButton = ( player->client->pers.cmd.buttons & BUTTON_ATTACK ) ? 1 : 0;
+			VrSquad_Log( 1, "order", "cmd=attack armed_ms=%d soldiers=%d", VRTAC_DESIGNATE_ARM_MS, VrSquad_CountBits( okMask ) );
 			VrMerc_Message( "Mercenary: aim at an enemy and fire" );
 		}
 	} else if ( !Q_stricmp( sub, "assist" ) ) {
-		int on;
+		int on = arg[0] ? ( atoi( arg ) != 0 ) : ( vr_merc_assist.integer == 0 );      // no argument: toggle
 
-		trap_Argv( 2, arg, sizeof( arg ) );
-		on = arg[0] ? ( atoi( arg ) != 0 ) : ( vr_merc_assist.integer == 0 );      // no argument: toggle
 		trap_Cvar_Set( "vr_merc_assist", on ? "1" : "0" );
-		if ( comp ) {
-			VrMerc_SetPassive( AICast_GetCastState( comp->s.number ), on ? qfalse : qtrue );
+		for ( i = 0; i < VRMERC_MAX_SQUAD; i++ ) {
+			gentity_t *comp;
+
+			if ( squad[i].slot < 0 ) {
+				continue;
+			}
+			mcur = &squad[i];
+			comp = VrMerc_Entity();
+			if ( comp ) {
+				VrMerc_SetPassive( AICast_GetCastState( comp->s.number ), on ? qfalse : qtrue );
+			}
 		}
-		VrTac_Log( 1, "order", "cmd=assist value=%d", on );
+		mcur = saved;
+		VrSquad_Log( 1, "order", "cmd=assist value=%d", on );
 		VrMerc_Message( on ? "Mercenary: will assist in combat" : "Mercenary: will not engage" );
 	} else {
 		// status (also the default)
-		G_Printf( "VR mercenary: state=%s order=%s slot=%d pending=%d assist=%d wanted=%d "
-				  "supervised=%d changes=%d attempts=%d stance=%s target=%d designated=%d maneuver=%d "
-				  "perceptions=%d candidates=%d\n",
-				  VrMerc_StateName( merc.state ), merc.order == VRMERC_ORDER_HOLD ? "HOLD" : "FOLLOW",
-				  merc.slot, merc.spawnPending, vr_merc_assist.integer, vr_merc.integer,
-				  merc.supervisedFrames, merc.stateChanges, merc.spawnAttempts,
-				  merc.stance == VRTAC_STANCE_AGGRESSIVE ? "aggressive" : "defensive", merc.target,
-				  merc.designated, merc.man.kind, merc.perceptionRuns, mtx.n );
-		trap_SendServerCommand( 0, va( "print \"Mercenary: %s (%s)\n\"", VrMerc_StateName( merc.state ),
-									   merc.order == VRMERC_ORDER_HOLD ? "hold" : "follow" ) );
+		int liveMask = VrMerc_LiveMask();
+
+		G_Printf( "VR mercenary squad: live=%d limit=%d pending=%d wanted=%d assist=%d stance=%s selected=%d narrow=%d\n",
+				  VrSquad_CountBits( liveMask ), VrMerc_SquadLimit(), sq.spawnPending, vr_merc.integer,
+				  vr_merc_assist.integer, vr_merc_stance.integer ? "aggressive" : "defensive", vr_merc_sel.integer, sq.narrow );
+		for ( i = 0; i < VRMERC_MAX_SQUAD; i++ ) {
+			if ( squad[i].slot < 0 && squad[i].state == VRMERC_NONE ) {
+				continue;
+			}
+			G_Printf( "VR mercenary %d: state=%s order=%s slot=%d health=%d target=%d designated=%d maneuver=%s move=%s "
+					  "supervised=%d changes=%d perceptions=%d\n",
+					  squad[i].id, VrMerc_StateName( squad[i].state ), squad[i].order == VRMERC_ORDER_HOLD ? "HOLD" : "FOLLOW",
+					  squad[i].slot, squad[i].slot >= 0 ? g_entities[squad[i].slot].health : 0, squad[i].target,
+					  squad[i].designated, VrMerc_ManName( squad[i].man.kind ), VrMove_ModeName( squad[i].move.mode ),
+					  squad[i].supervisedFrames, squad[i].stateChanges, squad[i].perceptionRuns );
+		}
+		trap_SendServerCommand( 0, va( "print \"Mercenary squad: %d of %d\n\"", VrSquad_CountBits( liveMask ), VrMerc_SquadLimit() ) );
 	}
 }
