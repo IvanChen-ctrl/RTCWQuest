@@ -901,6 +901,8 @@ static void VrMerc_ClearDesignation( const char *why ) {
 	merc.designatedUntil = 0;
 }
 
+static int VrMerc_CommittedTargetIndex( void );
+
 static void VrMerc_Perceive( gentity_t *player, gentity_t *ent, cast_state_t *cs ) {
 	int now = level.time, i, k, hits, total, cur = -1, sel, switched, newTarget;
 	vrTacScoreParams_t sp;
@@ -1045,7 +1047,11 @@ static void VrMerc_Perceive( gentity_t *player, gentity_t *ent, cast_state_t *cs
 		qboolean stockValid = VrMerc_HostileAlive( ent, cs->enemyNum );
 		qboolean designatedActive = ( merc.target == merc.designated ) ? qtrue : qfalse;
 
-		if ( !stockValid || switched || ( designatedActive && now - merc.lastOverrideAt >= VRTAC_REASSERT_MS ) ) {
+		int ci = VrMerc_CommittedTargetIndex();
+		qboolean sighted = ( ci >= 0 && ( mtx.cand[ci].visibleNow || mtx.cand[ci].designated ) ) ? qtrue : qfalse;
+
+		// never push the AI at a remembered-but-unseen enemy: it would shoot at walls and chase ghosts
+		if ( sighted && ( !stockValid || switched || ( designatedActive && now - merc.lastOverrideAt >= VRTAC_REASSERT_MS ) ) ) {
 			VrMerc_SetStockTarget( ent, cs, merc.target );
 		}
 	}
@@ -2443,6 +2449,19 @@ static void VrMerc_FollowTick( gentity_t *player, gentity_t *ent, cast_state_t *
 				( merc.state == VRMERC_FOLLOW || merc.state == VRMERC_ENGAGE ) &&
 				merc.man.kind == MAN_NONE && !VrMerc_ScriptBusy( cs ) ) ? qtrue : qfalse;
 
+	if ( !managed ) {
+		// a maneuver, a HOLD order, a script or another state owns the AI function now: only forget our own
+		// bookkeeping, never call the stock AI (that would overwrite the other owner's function)
+		if ( merc.moveForced || mercMoveMode[merc.slot] ) {
+			merc.moveForced = 0;
+			mercMoveMode[merc.slot] = VRMOVE_NEAR;
+			merc.move.mode = VRMOVE_NEAR;
+			merc.move.since = now;
+		}
+		VrRecover_Step( &merc.rec, ent->r.currentOrigin, 0, now );     // keeps the observation window fresh
+		return;
+	}
+
 	memset( &in, 0, sizeof( in ) );
 	in.euclid = d;
 	in.pathDist = merc.movePathDist;
@@ -2450,8 +2469,9 @@ static void VrMerc_FollowTick( gentity_t *player, gentity_t *ent, cast_state_t *
 	in.playerSpeed = sqrtf( player->client->ps.velocity[0] * player->client->ps.velocity[0] +
 							player->client->ps.velocity[1] * player->client->ps.velocity[1] );
 	// combat owns the movement while the companion is under fire, or fighting close to the player
-	in.suppressed = ( !managed || mtx.sustained || mtx.heavy || merc.rec.waitUntil > now ||
-					  ( merc.state == VRMERC_ENGAGE && d < 420.0f ) ) ? 1 : 0;
+	in.tight = ( now < merc.coverMeUntil ) ? 1 : 0;         // "cover me": stay closer to the player
+	in.suppressed = ( mtx.sustained || mtx.heavy || merc.rec.waitUntil > now ||
+					  ( merc.state == VRMERC_ENGAGE && d < ( in.tight ? 300.0f : 420.0f ) ) ) ? 1 : 0;
 
 	mode = VrMove_Update( &merc.move, &in, now );
 	mercMoveMode[merc.slot] = (unsigned char)mode;
