@@ -250,3 +250,30 @@ Owner builds the APK from the M4 branch, runs the checklist (M4 doc section 12) 
 If a behaviour is wrong, the `state`/`cover`/`flank`/`nav_failure` lines show which decision fired. Then: tune thresholds,
 or start M5.0 (host build of the server) if the owner approves.
 
+---
+
+## M4 hardware-feedback round — crouch, following, squad (same branch, PR #6)
+
+Owner's first PICO 4 test of M4: mercenary spawns, God Mode works; A did not crouch, only one mercenary, too slow, got lost,
+tactics weak. Details, causes, controls, diagnostics and the 21-point hardware plan: **`docs/M4_SQUAD_AND_MOVEMENT.md`**.
+**Everything is source-level and host-tested only; none of it is confirmed on the headset.**
+
+- **Crouch (read from source):** `vr_irl_crouch_enabled` defaults to 1 and `PM_CheckDuck`'s IRL branch returned before reading
+  `upmove < 0`, so `+movedown` did nothing; the press/release were also both gated by the backpack zone. Fixed with
+  `VrCrouchLogic.h` (shared by game/cgame) + `VrInput_DuckStep` (always-released latch) + `ev=crouch` in `RTCWInput`.
+- **Slow / lost (read from source):** stock AICast caps speed at speedScale 1.2 x run-animation speed (about 73-88% of the
+  player), and the leader chase stops at < 240 straight-line units without line of sight. Fixed (companion only) with
+  `g_vrmove.h`: path-distance NEAR/RUN/CATCHUP with hysteresis, a speed-floor hook in `ai_cast_think.c`, a bounded recovery
+  ladder (repath -> player's trail -> wait). No teleport. `vr_merc_move 0` restores the M3 behaviour.
+- **Squad:** `squad[4]` independent soldier records (unique AI names `vr_merc_1..4`), `vr_merc_squad` limit (default 2),
+  one recruit at a time, per-soldier/`all` addressing and a notebook selector, roles + single file in corridors, spread of
+  fire, wounded/no-ammo cover. `g_vrsquad.h` is the pure part.
+- **Tests:** `tests/vr_input` 53608, `vr_gameplay` 544, `vr_lifecycle` 94, `vr_tactics` 3042, `vr_squad` 653, all passing.
+  Mutation checks on the new pure logic caught all but equivalent mutants.
+- **Unknown until the headset test:** whether A now crouches, whether the speed floor looks right (foot sliding?), whether
+  CATCHUP/recovery keeps soldiers with the player through doors, how three soldiers perform, and the frame times.
+- **Not done:** teleport recovery (deliberately), companion persistence, per-soldier stance, splash-weapon friendly fire.
+
+Next session: owner builds the APK from the M4 branch, runs the plan, returns `adb logcat -s RTCWInput:I RTCWMerc:I
+RTCWTactical:I RTCWLifecycle:I RTCW:I` plus the frame-time table.
+

@@ -5,7 +5,10 @@ Branch `pico4-m4-tactical-ai`, stacked on `pico4-m3-gameplay-mercenary-mvp` (M3,
 source, decision logic covered by host tests, compiled by the Android workflow (see the pull request for the run).
 Whether the companion actually behaves as described is exactly what the hardware checklist in section 10 is for.
 
-Related: `docs/M3_GAMEPLAY_MERCENARY.md` (baseline), `docs/M5_PICO4_LAN_COOP_FEASIBILITY.md` (research only).
+Related: `docs/M3_GAMEPLAY_MERCENARY.md` (baseline), `docs/M5_PICO4_LAN_COOP_FEASIBILITY.md` (research only),
+**`docs/M4_SQUAD_AND_MOVEMENT.md`** (the hardware-feedback round: A-button crouch, adaptive following and recovery,
+the multi-soldier squad, formation, the 21-point hardware plan). Where this document says "the companion" in the singular,
+read "each soldier": the logic is per soldier since that round, and the squad default is 2.
 
 ## 1. Summary
 
@@ -25,7 +28,7 @@ navigation through AAS, aiming, firing, animation).
 | Stances | Defensive (default) and Aggressive change scoring, cover and flank thresholds |
 | Diagnostics | Logcat tag `RTCWTactical`, state changes and decisions only |
 
-One companion at a time (unchanged). Everything runs in the game module, offline, with no threads, no allocation and no
+A squad of up to 4 independent soldiers (default 2) since the hardware-feedback round; this document's behaviour description is per soldier. Everything runs in the game module, offline, with no threads, no allocation and no
 network.
 
 ## 2. Baseline verification (before adding tactics)
@@ -245,8 +248,9 @@ player higher and disables flanking. It is a bias, not a scripted action; the co
 | Hire | `> Hire a mercenary` | `merc hire` |
 | Status | - | `merc status` |
 
-Cvars: `vr_merc_stance` (0/1, not archived), `vr_merc_diag` (0/1/2, default 1), plus the M3 `vr_merc`,
-`vr_merc_assist`, `vr_merc_model`. The existing buttons, God Mode and everything else on the cheats page are unchanged;
+Cvars: `vr_merc_stance` (0/1, not archived), `vr_merc_diag` (0/1/2, default 1), plus the M3 `vr_merc` (now the number of
+soldiers to keep), `vr_merc_assist`, `vr_merc_model`; squad round: `vr_merc_squad` (limit, default 2), `vr_merc_sel` (0 = all,
+1-4), `vr_merc_move` (adaptive following, default 1). The orders accept `all` or a soldier number (`merc hold 2`). The existing buttons, God Mode and everything else on the cheats page are unchanged;
 a link was added at the bottom right. New file: `z_vr_assets/ui/mercenary.menu` (registered in `ui/ingame.txt`).
 As in M3, menu commands take effect after the notebook closes (the game is paused while it is open). Whether the cheats
 page corner button is reachable in VR is still unverified.
@@ -286,10 +290,10 @@ page corner button is reachable in VR is still unverified.
 
 ## 10. Diagnostics
 
-`adb logcat -s RTCWTactical:I` (add `RTCW:I RTCWInput:I` to correlate). Format, one event per line:
+`adb logcat -s RTCWTactical:I RTCWMerc:I` (add `RTCW:I RTCWInput:I` to correlate). Recruitment, lifecycle and movement events use the tag `RTCWMerc` (see `M4_SQUAD_AND_MOVEMENT.md`); decisions use `RTCWTactical`. Format, one event per line:
 
 ```
-v1 t=<level.time ms> ev=<name> key=value key=value ...
+v1 t=<level.time ms> ev=<name> id=<soldier 1-4, 0 = squad> key=value key=value ...
 ```
 
 `t` is the game clock (it stops while the game is paused). Reason values are the stable tokens of
@@ -298,7 +302,7 @@ v1 t=<level.time ms> ev=<name> key=value key=value ...
 
 | `ev` | Fields | When |
 |---|---|---|
-| `hired` | `ent character stance` | the companion joined |
+| `merc_hired` (tag `RTCWMerc`) | `ent name squad character stance` | a soldier joined |
 | `order` / `order_rejected` | `cmd ...` / `cmd reason` | a command was accepted / refused |
 | `state` | `from to reason after_ms` | every state change |
 | `target` / `target_lost` / `target_rejected` | `ent prev score dist visible designated candidates` / ... / `ent reason` | tactical target changes; a designation was refused |
@@ -310,7 +314,7 @@ v1 t=<level.time ms> ev=<name> key=value key=value ...
 | `regroup` | `trigger dist_to_player health` | regroup/retreat started |
 | `maneuver_end` | `kind reason took_ms` | any maneuver ended |
 | `nav_failure` | `maneuver dist ...` | a destination could not be reached (stall/timeout/return give-up) |
-| `stance`, `cover_me_end`, `recover`, `cleanup`, `drop` | ... | misc |
+| `stance`, `cover_me_end`, `recover`, `merc_died`/`merc_dismissed`, `drop` | ... | misc |
 
 The Windows Feedback Bridge only needs to capture this tag; nothing in that project was changed.
 
@@ -318,9 +322,10 @@ The Windows Feedback Bridge only needs to capture this tag; nothing in that proj
 
 | Suite | Checks | Covers |
 |---|---|---|
-| `tests/vr_tactics` (new) | 2625 | command validity, friend/foe classification (exhaustive table), designation range, damage windows, threat scoring, target selection and hysteresis (noise and switch simulations), friendly-fire geometry, formation slots and settling, cover reject/score/pick/want/exit, flank geometry/reject/want/exit/cooldown/failure limit, regroup/retreat/HOLD exception/cooldown, loop bounds, maneuver states in the base machine |
+| `tests/vr_tactics` (new) | 3042 | command validity, friend/foe classification (exhaustive table), designation range, damage windows, threat scoring, target selection and hysteresis (noise and switch simulations), friendly-fire geometry, formation slots and settling, cover reject/score/pick/want/exit, flank geometry/reject/want/exit/cooldown/failure limit, regroup/retreat/HOLD exception/cooldown, loop bounds, maneuver states in the base machine |
+| `tests/vr_squad` (hardware-feedback round) | 653 | adaptive follow modes and hysteresis, speed floor, stuck-recovery ladder, breadcrumb trail, squad limit/identity/addressing, formation roles, target distribution, recruitment sequences |
 | `tests/vr_gameplay` | 544 | M3 mercenary and God Mode logic, unchanged |
-| `tests/vr_input` | 139 | controller input, unchanged |
+| `tests/vr_input` | 53608 | controller input, plus (hardware-feedback round) the crouch button state machine, the crouch height rule and their pipeline from the raw hand input |
 | `tests/vr_lifecycle` | 94 | OpenXR/Android lifecycle, unchanged |
 
 Run: `make -C tests/vr_tactics test` (also `vr_gameplay`, `vr_input`, `vr_lifecycle`); all four run in
@@ -343,7 +348,7 @@ the table in `docs/PICO4_INPUT_TEST_PLAN.md` style (date, build SHA, result, log
 
 | # | Test | Do | Pass looks like | Log |
 |---|---|---|---|---|
-| 1 | Hiring | Notebook -> bucket list -> Hire | "Mercenary: hired", soldier appears near you | `hired` |
+| 1 | Hiring | Notebook -> bucket list -> Hire | "Mercenary: hired", soldier appears near you | `merc_hired` |
 | 2 | Model/animation | Walk, stop, turn | Visible, animated, not T-posed | - |
 | 3 | Corridor following | Walk through a corridor and a door | Stays within a few metres, arrives after you | `state`, no `nav_failure` |
 | 4 | Obstacles | Walk around crates/pillars | Does not get stuck; if it does, `nav_failure` | `nav_failure` |
@@ -356,7 +361,7 @@ the table in `docs/PICO4_INPUT_TEST_PLAN.md` style (date, build SHA, result, log
 | 11 | Regroup | Send it away (Hold), then `Regroup` | Comes to you | `regroup trigger=command` |
 | 12 | Stances | Toggle Defensive/Aggressive | Message each time; behaviour differs mildly | `stance` |
 | 13 | Dismiss | `Dismiss` | Soldier disappears, no error | `cleanup reason=dismissed` |
-| 14 | Save/load | Quicksave, load | No crash; a new companion appears (not the same one) | `hired` |
+| 14 | Save/load | Quicksave, load | No crash; new soldiers appear (not the same ones) | `merc_hired` |
 | 15 | God Mode | Toggle, take hits | Unchanged from M3 | - |
 | 16 | B-button jump | Jump | Jumps | `RTCWInput ev=jump` |
 | 17 | Sleep/resume | Remove headset, wait, wear it | Resumes (M3 hotfix 2B) | `RTCWLifecycle` |
@@ -369,7 +374,7 @@ Please report anything where the log contradicts the observed behaviour; that is
 ## 13. Known issues and not implemented
 
 - Not run in the engine at all. Tuning values (distances, thresholds, cooldowns) are first guesses.
-- One companion; not persisted across save/load (re-hired, orders and health reset). Unchanged from M3.
+- Soldiers are not persisted across save/load (re-hired up to the remembered count; orders, health and ammo reset). Unchanged from M3.
 - Splash/explosive weapons are not part of friendly-fire avoidance; reloading under pressure is not a cover trigger
   (not reliably observable); no voice/gesture commands; no per-weapon tactics.
 - "Enemy targets X" is read from the enemy's AI target while visible, which is an approximation.
