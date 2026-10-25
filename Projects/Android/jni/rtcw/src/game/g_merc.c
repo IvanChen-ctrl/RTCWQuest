@@ -474,7 +474,8 @@ static void VrMerc_BuildHireContext( gentity_t *player, vrMercHireContext_t *c )
 VrMerc_IsMercEntity
 
 Used by the savegame writer: the companion is not saved (a load would find a
-client slot that the freshly started level has not created and abort).
+client slot that the freshly started level has not created and abort), and neither
+are the temporary goal entities it walks to.
 ===============
 */
 qboolean VrMerc_IsMercEntity( int entnum ) {
@@ -485,6 +486,12 @@ qboolean VrMerc_IsMercEntity( int entnum ) {
 	}
 	ent = &g_entities[entnum];
 	if ( VrMerc_IsCompanion( ent ) ) {
+		return qtrue;
+	}
+	// the companion's temporary destination entities (HOLD post, maneuver goal) mean nothing without it
+	if ( ent->inuse && ent->classname && entnum >= 0 &&
+		 ( ( entnum == merc.holdGoal && !strcmp( ent->classname, VRMERC_WAITGOAL ) ) ||
+		   ( entnum == merc.man.goalEnt && !strcmp( ent->classname, VRMERC_MANGOAL ) ) ) ) {
 		return qtrue;
 	}
 	// also the unconsumed spawn request, otherwise a save taken in that short window

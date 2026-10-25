@@ -1,6 +1,6 @@
 # HANDOFF
 
-## Status (updated in M3 — read "Milestone 3" at the bottom first)
+## Status (updated in M4 — read "Milestone 4" at the bottom first, then "Milestone 3")
 M0 (audit/docs), M1A (CI workflow) and M2A (controller fixes) are merged to `master` (PR #1, #2, #3). On a real PICO 4 the
 menu and controller clicks work after M2A (owner report). M2B (PR #4, cinematic skip / pointer) is **not merged**: its
 cinematic fix did not pass physical validation; the existing cinematic can finish by itself and saved games load, so
@@ -207,3 +207,46 @@ Removed: the `OpenXRTestWakeLock` (kept `FLAG_KEEP_SCREEN_ON`).
 Owner builds the APK (Actions -> Android Debug APK -> this branch), runs the checklist in the M3 doc and returns the
 logcat (`adb logcat -s RTCWInput:I RTCW:I`). If B still does not jump, compare `ev=btn name=B` with `ev=jump`. If the
 mercenary does not appear, `merc status` and the `VR AI spawn ...` / `VR mercenary: ...` lines in the `RTCW` tag show where.
+
+---
+
+## Milestone 4 — tactical mercenary AI, M5 LAN co-op research
+
+Branch `pico4-m4-tactical-ai`, **stacked on** `pico4-m3-gameplay-mercenary-mvp` (M3 PR #5 still open; the M4 PR targets the
+M3 branch, not `master`). Full description, state table, commands, limits and the 20-point headset checklist:
+`docs/M4_TACTICAL_AI.md`. M5 research: `docs/M5_PICO4_LAN_COOP_FEASIBILITY.md`. **Nothing is verified on a headset.**
+
+### What exists in code
+- `g_vrtactics.h` (new, pure): command validation, friend/foe classification, threat score, target selection with
+  commitment + hysteresis, damage windows, friendly-fire line test, formation slots, cover / flank / regroup entry and
+  exit rules, reason codes.
+- `g_merc.c`: tactical context from the companion's own sight memory (250 ms), target applied to the stock AI,
+  hold-fire when the player/an ally is in the line of fire, formation correction, designation by fire press
+  (`merc attack`), cover (stock hide pos + local samples, executed by `AIFunc_BattleTakeCoverStart`), bounded flank
+  (goal entity + stock chase), regroup/retreat (stock chase of the player), stances, `RTCWTactical` diagnostics.
+- `g_vrlogic.h`: `VRMERC_COVER/FLANK/REGROUP` appended (M3 numbering unchanged); the M3 machine leaves them alone.
+- UI: `z_vr_assets/ui/mercenary.menu` (10 buttons), link on the cheats page, registered in `ui/ingame.txt`.
+- Console: `merc attack [now] | cover | regroup | stance [defensive|aggressive]` added to the M3 commands.
+  Cvars `vr_merc_stance`, `vr_merc_diag`.
+- Savegames: the companion's temporary goal entities are now skipped like the companion.
+
+### Tests
+`make -C tests/vr_tactics test` -> 2625 checks, 0 failures (new). `vr_gameplay` 544, `vr_input` 139, `vr_lifecycle` 94, unchanged
+and passing. 40 deliberate mutations of the pure logic all fail a test. All four run in
+`.github/workflows/input-host-tests.yml`. `g_merc.c`, `g_combat.c`, `g_main.c`, `g_cmds.c`, `g_save.c` pass `gcc -fsyntax-only`
+against the real engine headers (zero warnings in `g_merc.c`). The Android build result is in the pull request.
+
+### Not done / unknown
+- No engine run of any M4 behaviour; all thresholds are first guesses. The stock AI interaction (calling
+  `AIFunc_BattleTakeCoverStart` / `AIFunc_ChaseGoalStart` from the supervisor) is the same pattern the stock use-order uses
+  but is unproven for these states.
+- Companion still not persisted; one companion; no splash-weapon friendly-fire handling; no reload-under-pressure trigger.
+- M5: research only, no multiplayer code. Key finding: the VR pose reaches the game module through a process-local global
+  (`gVR`, 100 uses), not through the protocol, so co-op needs a per-client pose path first. Recommended prototype host:
+  a PC dedicated server (Option B).
+
+### Next session
+Owner builds the APK from the M4 branch, runs the checklist (M4 doc section 12) and returns `adb logcat -s RTCWTactical:I RTCW:I`.
+If a behaviour is wrong, the `state`/`cover`/`flank`/`nav_failure` lines show which decision fired. Then: tune thresholds,
+or start M5.0 (host build of the server) if the owner approves.
+
