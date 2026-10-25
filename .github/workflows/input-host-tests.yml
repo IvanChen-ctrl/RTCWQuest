@@ -14,8 +14,10 @@ on:
       - 'tests/vr_input/**'
       - 'tests/vr_gameplay/**'
       - 'tests/vr_lifecycle/**'
+      - 'tests/vr_tactics/**'
       - 'Projects/Android/jni/RTCWVR/VrLifecycleLogic.h'
       - 'Projects/Android/jni/rtcw/src/game/g_vrlogic.h'
+      - 'Projects/Android/jni/rtcw/src/game/g_vrtactics.h'
       - 'Projects/Android/jni/RTCWVR/VrInputLogic.h'
       - 'Projects/Android/jni/RTCWVR/VrInputDiag.c'
       - 'Projects/Android/jni/RTCWVR/VrInputDiag.h'
@@ -40,3 +42,6 @@ jobs:
 
       - name: Lifecycle (OpenXR session, Android pause/resume) host tests
         run: make -C tests/vr_lifecycle test
+
+      - name: Tactical mercenary AI (M4) host tests
+        run: make -C tests/vr_tactics test

@@ -1055,6 +1055,7 @@ void G_Damage( gentity_t *targ, gentity_t *inflictor, gentity_t *attacker,
 	if ( VrMerc_DamageBlocked( targ, attacker ) ) {
 		return;
 	}
+	VrMerc_NoteDamage( targ, attacker, damage );
 
 	if ( !dir ) {
 		dflags |= DAMAGE_NO_KNOCKBACK;

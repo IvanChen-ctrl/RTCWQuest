@@ -1097,6 +1097,8 @@ extern vmCvar_t vr_godmode;
 extern vmCvar_t vr_merc;
 extern vmCvar_t vr_merc_assist;
 extern vmCvar_t vr_merc_model;
+extern vmCvar_t vr_merc_stance;
+extern vmCvar_t vr_merc_diag;
 qboolean G_VrGodProtects( gentity_t *targ, int dflags );
 void     G_VrGodModeChanged( void );
 void     VrMerc_Init( void );
@@ -1104,6 +1106,7 @@ void     VrMerc_Frame( void );
 void     VrMerc_ClientCommand( gentity_t *ent );
 qboolean VrMerc_IsMercEntity( int entnum );
 qboolean VrMerc_DamageBlocked( gentity_t *targ, gentity_t *attacker );
+void     VrMerc_NoteDamage( gentity_t *targ, gentity_t *attacker, int damage );
 
 extern vmCvar_t g_dedicated;
 extern vmCvar_t g_cheats;

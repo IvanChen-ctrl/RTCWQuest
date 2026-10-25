@@ -66,6 +66,8 @@ vmCvar_t vr_godmode;        // single-player God Mode (VR notebook / console), d
 vmCvar_t vr_merc;           // companion requested for this session (hire/dismiss intent)
 vmCvar_t vr_merc_assist;    // companion may engage hostile targets
 vmCvar_t vr_merc_model;     // preferred model directory for the next hire ("" = automatic)
+vmCvar_t vr_merc_stance;    // 0 = defensive, 1 = aggressive companion stance
+vmCvar_t vr_merc_diag;      // RTCWTactical logcat diagnostics: 0 off, 1 events, 2 also rejections
 
 vmCvar_t g_dmflags;
 vmCvar_t g_fraglimit;
@@ -169,6 +171,8 @@ cvarTable_t gameCvarTable[] = {
 	{ &vr_merc, "vr_merc", "0", 0, 0, qfalse },
 	{ &vr_merc_assist, "vr_merc_assist", "1", 0, 0, qfalse },
 	{ &vr_merc_model, "vr_merc_model", "", 0, 0, qfalse },
+	{ &vr_merc_stance, "vr_merc_stance", "0", 0, 0, qfalse },
+	{ &vr_merc_diag, "vr_merc_diag", "1", 0, 0, qfalse },
 
 // JPW NERVE multiplayer stuffs
 	{ &g_redlimbotime, "g_redlimbotime", "30000", CVAR_SERVERINFO | CVAR_LATCH, 0, qfalse },
