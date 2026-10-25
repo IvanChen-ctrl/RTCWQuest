@@ -206,6 +206,7 @@ typedef struct
     bool                Focused;
     bool                FrameSetup;
     uint32_t            FinishedEyeMask;
+    uint32_t            AcquiredEyeMask;   // eyes whose swapchain image was acquired for the current frame
 
     float               Width;
     float               Height;
@@ -305,10 +306,19 @@ double TBXR_GetTimeInMilliSeconds();
 int TBXR_GetRefresh();
 void TBXR_Recenter();
 void TBXR_InitialiseOpenXR();
-void TBXR_WaitForSessionActive();
+qboolean TBXR_WaitForSessionActive();
 void TBXR_InitRenderer();
 void TBXR_LeaveVR();
-void TBXR_EnterVR();
+qboolean TBXR_EnterVR();
+// Lifecycle (see VrLifecycleLogic.h)
+qboolean TBXR_RecreatePending( void );
+void TBXR_ClearRecreatePending( void );
+void TBXR_OnSessionCreated( void );
+void TBXR_OnSessionCreateFailed( void );
+void TBXR_NotifyActivityDestroyed( void );
+void TBXR_NoteAndroidLifecycle( int resumed );
+int TBXR_NoteSurface( int surfaceId );
+void RTCWVR_RequestAppExit( const char *reason );
 void TBXR_GetScreenRes(int *width, int *height);
 void TBXR_InitActions( void );
 void TBXR_DestroyActions( void );

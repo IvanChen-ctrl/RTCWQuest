@@ -22,12 +22,20 @@ EFXR_SurfaceView.c; the JNI VM/activity the loader needs come from gAppThread
 #include "TBXR_Common.h"
 #include "VrCvars.h"
 #include "VrInputDiag.h"
+#include "VrLifecycleLogic.h"
+#include "VrLifecycleLog.h"
 
 #include <time.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+
+// Lifecycle state shared by the Android callbacks (UI thread, plain int writes) and the
+// render/engine thread.  Decisions are made by VrLifecycleLogic.h.
+vrLifecycle_t gLife;
+static volatile int gRecreatePending;
+GLboolean ovrApp_HandleXrEvents(ovrApp* app);
 
 
 const float ZOOM_FOV_ADJUST = 1.05f;
@@ -461,12 +469,21 @@ void ovrFramebuffer_Acquire(ovrFramebuffer* frameBuffer) {
     XrResult res = xrWaitSwapchainImage(frameBuffer->ColorSwapChain.Handle, &waitInfo);
     int i = 0;
     while (res == XR_TIMEOUT_EXPIRED) {
-        res = xrWaitSwapchainImage(frameBuffer->ColorSwapChain.Handle, &waitInfo);
         i++;
-        ALOGV(
-                " Retry xrWaitSwapchainImage %d times due to XR_TIMEOUT_EXPIRED (duration %f seconds)",
-                i,
-                waitInfo.timeout * (1E-9));
+        RTCWLife_Log("xrWaitSwapchainImage timeout #%d running=%d xr=%s", i, gLife.running, VrLife_StateName(gLife.xrState));
+        // The headset may have gone to sleep in the middle of the frame: look at the session state
+        // instead of waiting forever for an image the runtime will never hand over.
+        ovrApp_HandleXrEvents(&gAppState);
+        if (!VrLife_SwapchainShouldRetry(&gLife, i)) {
+            // The acquired image was never waited for and cannot be released, so this swapchain is
+            // not usable any more: rebuild the session objects before the next frame.
+            RTCWLife_Log("giving up on swapchain %p after %d timeouts: graphics objects will be recreated",
+                         (void*)frameBuffer->ColorSwapChain.Handle, i);
+            VrLife_OnGraphicsLost(&gLife);
+            gRecreatePending = 1;
+            return;
+        }
+        res = xrWaitSwapchainImage(frameBuffer->ColorSwapChain.Handle, &waitInfo);
     }
 
     if (XR_FAILED(res)) {
@@ -761,6 +778,18 @@ ovrApp
 */
 
 
+// The lifecycle logic uses plain numbers; they must equal the OpenXR values.
+_Static_assert(VRL_XR_IDLE == XR_SESSION_STATE_IDLE && VRL_XR_READY == XR_SESSION_STATE_READY &&
+			   VRL_XR_SYNCHRONIZED == XR_SESSION_STATE_SYNCHRONIZED && VRL_XR_VISIBLE == XR_SESSION_STATE_VISIBLE &&
+			   VRL_XR_FOCUSED == XR_SESSION_STATE_FOCUSED && VRL_XR_STOPPING == XR_SESSION_STATE_STOPPING &&
+			   VRL_XR_LOSS_PENDING == XR_SESSION_STATE_LOSS_PENDING && VRL_XR_EXITING == XR_SESSION_STATE_EXITING,
+			   "VrLifecycleLogic.h session state numbers differ from OpenXR");
+_Static_assert(VRL_XR_SESSION_LOSS_PENDING == XR_SESSION_LOSS_PENDING && VRL_XR_FRAME_DISCARDED == XR_FRAME_DISCARDED &&
+			   VRL_XR_ERROR_INSTANCE_LOST == XR_ERROR_INSTANCE_LOST &&
+			   VRL_XR_ERROR_SESSION_NOT_RUNNING == XR_ERROR_SESSION_NOT_RUNNING &&
+			   VRL_XR_ERROR_SESSION_LOST == XR_ERROR_SESSION_LOST,
+			   "VrLifecycleLogic.h result codes differ from OpenXR");
+
 void ovrApp_Clear(ovrApp* app) {
 	app->Focused = false;
 	app->Instance = XR_NULL_HANDLE;
@@ -784,34 +813,87 @@ void ovrApp_Clear(ovrApp* app) {
 	app->RenderThreadTid = 0;
 	app->NativeWindow = NULL;
 	app->NativeWindowChanged = false;
+	app->AcquiredEyeMask = 0;
 	ovrEgl_Clear(&app->Egl);
+	{
+		int resumed = gLife.androidResumed, surface = gLife.surfaceId;
+
+		VrLife_Init(&gLife);
+		gLife.androidResumed = resumed;
+		gLife.surfaceId = surface;
+		gRecreatePending = 0;
+	}
 }
 
 
 
 static const char *TBXR_SessionStateName(XrSessionState state);
 
+static void TBXR_LogLifecycleStatus(const char *what)
+{
+	RTCWLife_Log("%s: xr=%s running=%d focused=%d visible=%d lost=%d exit=%d gfx=%d android_resumed=%d surface=%d",
+				 what, VrLife_StateName(gLife.xrState), gLife.running, gLife.focused, gLife.visible,
+				 gLife.sessionLost, gLife.exitRequested, gLife.graphicsValid, gLife.androidResumed, gLife.surfaceId);
+}
+
+// Carries out an action decided by VrLifecycleLogic.h.
+static void TBXR_ApplyLifecycleAction(ovrApp* app, vrlAction_t act)
+{
+	while (act != VRL_ACT_NONE) {
+		vrlAction_t next = VRL_ACT_NONE;
+
+		switch (act) {
+			case VRL_ACT_BEGIN_SESSION: {
+				XrSessionBeginInfo sessionBeginInfo;
+				XrResult result;
+
+				memset(&sessionBeginInfo, 0, sizeof(sessionBeginInfo));
+				sessionBeginInfo.type = XR_TYPE_SESSION_BEGIN_INFO;
+				sessionBeginInfo.next = NULL;
+				sessionBeginInfo.primaryViewConfigurationType = app->ViewportConfig.viewConfigurationType;
+				OXR(result = xrBeginSession(app->Session, &sessionBeginInfo));
+				RTCWLife_Log("xrBeginSession result=%d", (int)result);
+				next = VrLife_OnBeginResult(&gLife, (int)result);
+				break;
+			}
+			case VRL_ACT_END_SESSION: {
+				XrResult result;
+
+				OXR(result = xrEndSession(app->Session));
+				RTCWLife_Log("xrEndSession result=%d", (int)result);
+				VrLife_OnEndResult(&gLife, (int)result);
+				// no frame can be in flight any more
+				app->FrameSetup = false;
+				app->FinishedEyeMask = 0;
+				app->AcquiredEyeMask = 0;
+				app->FrameState.predictedDisplayTime = 0;
+				break;
+			}
+			case VRL_ACT_DESTROY_AND_RECREATE:
+				// done at the start of the next engine frame (RTCWVR_FrameSetup), on the engine thread
+				gRecreatePending = 1;
+				app->FrameSetup = false;
+				RTCWLife_Log("session recreate requested");
+				break;
+			case VRL_ACT_EXIT_APP:
+				RTCWVR_RequestAppExit("lifecycle");
+				break;
+			default:
+				break;
+		}
+		act = next;
+	}
+	app->SessionActive = gLife.running ? GL_TRUE : GL_FALSE;
+	app->Focused = gLife.focused != 0;
+}
+
 void ovrApp_HandleSessionStateChanges(ovrApp* app, XrSessionState state) {
-	if (state == XR_SESSION_STATE_READY) {
-		assert(app->SessionActive == false);
-		app->Focused = false;
+	vrlAction_t act = VrLife_OnSessionState(&gLife, (int)state);
 
-		XrSessionBeginInfo sessionBeginInfo;
-		memset(&sessionBeginInfo, 0, sizeof(sessionBeginInfo));
-		sessionBeginInfo.type = XR_TYPE_SESSION_BEGIN_INFO;
-		sessionBeginInfo.next = NULL;
-		sessionBeginInfo.primaryViewConfigurationType = app->ViewportConfig.viewConfigurationType;
-
-		XrResult result;
-		OXR(result = xrBeginSession(app->Session, &sessionBeginInfo));
-
-		app->SessionActive = (result == XR_SUCCESS);
-	} else if (state == XR_SESSION_STATE_STOPPING) {
-		assert(app->SessionActive);
-
-		OXR(xrEndSession(app->Session));
-		app->SessionActive = false;
-		app->Focused = false;
+	RTCWLife_Log("xr session state -> %s action=%s", VrLife_StateName((int)state), VrLife_ActionName(act));
+	TBXR_ApplyLifecycleAction(app, act);
+	if (act != VRL_ACT_NONE) {
+		TBXR_LogLifecycleStatus("after action");
 	}
 }
 
@@ -831,15 +913,18 @@ GLboolean ovrApp_HandleXrEvents(ovrApp* app) {
 		}
 
 		switch (baseEventHeader->type) {
-			case XR_TYPE_EVENT_DATA_EVENTS_LOST:
-				ALOGV("xrPollEvent: received XR_TYPE_EVENT_DATA_EVENTS_LOST event");
-				break;
+			case XR_TYPE_EVENT_DATA_EVENTS_LOST: {
+				const XrEventDataEventsLost* lost = (XrEventDataEventsLost*)(baseEventHeader);
+				RTCWLife_Log("xrPollEvent: EVENTS_LOST count=%u", (unsigned)lost->lostEventCount);
+			} break;
 			case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING: {
 				const XrEventDataInstanceLossPending* instance_loss_pending_event =
 						(XrEventDataInstanceLossPending*)(baseEventHeader);
-				ALOGV(
-						"xrPollEvent: received XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING event: time %f",
-						FromXrTime(instance_loss_pending_event->lossTime));
+				RTCWLife_Log("xrPollEvent: INSTANCE_LOSS_PENDING lossTime=%f", FromXrTime(instance_loss_pending_event->lossTime));
+				// The instance (not just the session) is going away. Rebuilding the instance is not
+				// supported, so leave cleanly instead of freezing on a dead instance.
+				gLife.exitRequested = 1;
+				TBXR_ApplyLifecycleAction(app, VRL_ACT_EXIT_APP);
 			} break;
 			case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED:
 				ALOGV("xrPollEvent: received XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED event");
@@ -865,36 +950,19 @@ GLboolean ovrApp_HandleXrEvents(ovrApp* app) {
 			case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING: {
 				XrEventDataReferenceSpaceChangePending* ref_space_change_event =
 						(XrEventDataReferenceSpaceChangePending*)(baseEventHeader);
-				ALOGV(
-						"xrPollEvent: received XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING event: changed space: %d for session %p at time %f",
-						ref_space_change_event->referenceSpaceType,
-						(void*)ref_space_change_event->session,
-						FromXrTime(ref_space_change_event->changeTime));
+				RTCWLife_Log("xrPollEvent: REFERENCE_SPACE_CHANGE_PENDING type=%d", (int)ref_space_change_event->referenceSpaceType);
 				recenter = GL_TRUE;
 			} break;
 			case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
 				const XrEventDataSessionStateChanged* session_state_changed_event =
 						(XrEventDataSessionStateChanged*)(baseEventHeader);
-				ALOGV(
-						"xrPollEvent: received XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: %d for session %p at time %f",
-						session_state_changed_event->state,
-						(void*)session_state_changed_event->session,
-						FromXrTime(session_state_changed_event->time));
-
-				switch (session_state_changed_event->state) {
-					case XR_SESSION_STATE_FOCUSED:
-						app->Focused = true;
-						break;
-					case XR_SESSION_STATE_VISIBLE:
-						app->Focused = false;
-						break;
-					case XR_SESSION_STATE_READY:
-					case XR_SESSION_STATE_STOPPING:
-						ovrApp_HandleSessionStateChanges(app, session_state_changed_event->state);
-						break;
-					default:
-						break;
+				if (session_state_changed_event->session != app->Session) {
+					// event of a session that was already destroyed (e.g. before a recreate)
+					RTCWLife_Log("xrPollEvent: stale session event ignored (state=%s)",
+								 TBXR_SessionStateName(session_state_changed_event->state));
+					break;
 				}
+				ovrApp_HandleSessionStateChanges(app, session_state_changed_event->state);
 			} break;
 			default:
 				ALOGV("xrPollEvent: Unknown event");
@@ -906,7 +974,7 @@ GLboolean ovrApp_HandleXrEvents(ovrApp* app) {
 
 
 ovrApp gAppState;
-bool destroyed = qfalse;
+volatile bool destroyed = qfalse;   // set from the Activity's onDestroy (UI thread), read by the engine thread
 
 static const char *TBXR_SessionStateName(XrSessionState state)
 {
@@ -1027,11 +1095,11 @@ void TBXR_InitialiseResolution()
 	gAppState.Height = gAppState.ViewConfigurationView[0].recommendedImageRectHeight;
 }
 
-void TBXR_EnterVR( ) {
+qboolean TBXR_EnterVR( ) {
 
 	if (gAppState.Session) {
-		Com_Printf("TBXR_EnterVR called with existing session");
-		return;
+		RTCWLife_Log("TBXR_EnterVR called with an existing session; ignored");
+		return qtrue;
 	}
 
 	// Create the OpenXR Session bound to the current EGL/GLES context.
@@ -1051,9 +1119,12 @@ void TBXR_EnterVR( ) {
 
 	XrResult initResult;
 	OXR(initResult = xrCreateSession(gAppState.Instance, &sessionCreateInfo, &gAppState.Session));
+	RTCWLife_Log("xrCreateSession result=%d session=%p gl_context=%p", (int)initResult, (void*)gAppState.Session,
+				 (void*)graphicsBindingAndroidGLES.context);
 	if (initResult != XR_SUCCESS) {
 		ALOGE("Failed to create XR session: %d.", initResult);
-		exit(1);
+		gAppState.Session = XR_NULL_HANDLE;
+		return qfalse;
 	}
 
 	// Create a space to the first path
@@ -1062,6 +1133,7 @@ void TBXR_EnterVR( ) {
 	spaceCreateInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
 	spaceCreateInfo.poseInReferenceSpace.orientation.w = 1.0f;
 	OXR(xrCreateReferenceSpace(gAppState.Session, &spaceCreateInfo, &gAppState.ViewSpace));
+	return qtrue;
 }
 
 void TBXR_LeaveVR( ) {
@@ -1105,6 +1177,7 @@ void *TBXR_GetCurrentGLContext( void )
 // already gone -- that's expected and non-fatal.
 void TBXR_DestroySessionForReinit( void )
 {
+	RTCWLife_Log("destroying session %p and its graphics objects", (void*)gAppState.Session);
 	TBXR_DestroyActions();
 
 	if (gAppState.Session != XR_NULL_HANDLE) {
@@ -1115,7 +1188,12 @@ void TBXR_DestroySessionForReinit( void )
 		gAppState.Session = XR_NULL_HANDLE;
 	}
 	gAppState.SessionActive = GL_FALSE;
+	gAppState.Focused = false;
 	gAppState.FrameSetup = false;
+	gAppState.FinishedEyeMask = 0;
+	gAppState.AcquiredEyeMask = 0;
+	gAppState.FrameState.predictedDisplayTime = 0;
+	VrLife_OnSessionDestroyed(&gLife);
 
 	ovrRenderer_Destroy( &gAppState.Renderer );
 	ovrFramebuffer_Destroy( &gAppState.Renderer.NullFrameBuffer );
@@ -1329,8 +1407,13 @@ void TBXR_Recenter() {
 	}
 
 	// Delete previous space instances
+	if (gAppState.LocalSpace != XR_NULL_HANDLE) {
+		OXR(xrDestroySpace(gAppState.LocalSpace));
+		gAppState.LocalSpace = XR_NULL_HANDLE;
+	}
 	if (gAppState.StageSpace != XR_NULL_HANDLE) {
 		OXR(xrDestroySpace(gAppState.StageSpace));
+		gAppState.StageSpace = XR_NULL_HANDLE;
 	}
 
 	spaceCreateInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
@@ -1341,13 +1424,95 @@ void TBXR_Recenter() {
 	ALOGV("Created stage space");
 }
 
-void TBXR_WaitForSessionActive()
-{//Now wait for the session to be ready
-	while (!gAppState.SessionActive) {
-		TBXR_ProcessMessageQueue();
-		if (ovrApp_HandleXrEvents(&gAppState)) {
-			TBXR_Recenter();
+qboolean TBXR_RecreatePending( void )
+{
+	return gRecreatePending != 0;
+}
+
+void TBXR_ClearRecreatePending( void )
+{
+	gRecreatePending = 0;
+}
+
+// A new session, spaces, swapchains and actions were created successfully.
+void TBXR_OnSessionCreated( void )
+{
+	VrLife_OnRecreateResult(&gLife, 1);
+	TBXR_LogLifecycleStatus("session created");
+}
+
+// Creating the session failed: retry a bounded number of times, then leave cleanly.
+void TBXR_OnSessionCreateFailed( void )
+{
+	vrlAction_t act = VrLife_OnRecreateResult(&gLife, 0);
+
+	RTCWLife_Log("session creation failed (%d in a row) action=%s", gLife.recreateFailures, VrLife_ActionName(act));
+	if (act == VRL_ACT_EXIT_APP) {
+		TBXR_ApplyLifecycleAction(&gAppState, act);
+	} else {
+		gRecreatePending = 1;
+		usleep(500000);     // back off instead of spinning on a runtime that is not ready
+	}
+}
+
+// Called from the Activity's onDestroy (UI thread).
+void TBXR_NotifyActivityDestroyed( void )
+{
+	RTCWLife_Log("activity destroyed: render thread will shut down");
+	destroyed = true;
+}
+
+void TBXR_NoteAndroidLifecycle( int resumed )
+{
+	if (resumed) {
+		VrLife_OnAndroidResume(&gLife);
+	} else {
+		VrLife_OnAndroidPause(&gLife);
+	}
+}
+
+// Returns 1 if the Android Surface identity changed.
+int TBXR_NoteSurface( int surfaceId )
+{
+	return VrLife_OnSurface(&gLife, surfaceId);
+}
+
+// Blocks the engine thread until the session can render (READY -> xrBeginSession done), polling
+// events with a short sleep.  Returns qfalse if the session has to be rebuilt first or the
+// application is shutting down; the caller must not continue to render in that case.
+qboolean TBXR_WaitForSessionActive()
+{
+	double start = TBXR_GetTimeInMilliSeconds();
+	int lastLogMs = -1;
+
+	for (;;) {
+		vrlWait_t w = VrLife_WaitDecision(&gLife, destroyed);
+		int waited = (int)(TBXR_GetTimeInMilliSeconds() - start);
+
+		if (w == VRL_WAIT_PROCEED) {
+			return qtrue;
 		}
+		if (w == VRL_WAIT_EXIT) {
+			if (!destroyed) {
+				usleep(20000);      // shutdown was requested; do not spin until the process ends
+			}
+			return qfalse;
+		}
+		if (w == VRL_WAIT_RECREATE) {
+			gRecreatePending = 1;
+			return qfalse;
+		}
+
+		if (VrLife_WaitLogDue(waited, lastLogMs, 5000)) {
+			TBXR_LogLifecycleStatus("waiting for the session to become READY");
+			lastLogMs = waited;
+		}
+		if (gAppState.Session != XR_NULL_HANDLE) {
+			if (ovrApp_HandleXrEvents(&gAppState)) {
+				TBXR_Recenter();
+			}
+		}
+		usleep(5000);
 	}
 }
 
@@ -1377,6 +1542,33 @@ static void TBXR_GetHMDOrientation() {
 }
 
 
+// Logs a failing frame call once per distinct result (never per frame) and carries out the verdict.
+static qboolean TBXR_FrameCallFailed(const char *call, XrResult result)
+{
+	static XrResult lastResult[3];
+	static const char *lastCall[3];
+	vrlFrameVerdict_t verdict = VrLife_OnFrameResult(&gLife, (int)result);
+	int slot = (call[2] == 'W') ? 0 : (call[2] == 'B') ? 1 : 2;      // xrWaitFrame / xrBeginFrame / xrEndFrame
+
+	if (result != XR_SUCCESS && (lastCall[slot] != call || lastResult[slot] != result)) {
+		RTCWLife_Log("%s result=%d verdict=%d running=%d xr=%s", call, (int)result, (int)verdict,
+					 gLife.running, VrLife_StateName(gLife.xrState));
+		lastCall[slot] = call;
+		lastResult[slot] = result;
+	}
+	if (result == XR_SUCCESS) {
+		lastResult[slot] = XR_SUCCESS;
+	}
+	if (verdict == VRL_FRAME_RECREATE) {
+		gRecreatePending = 1;
+	} else if (verdict == VRL_FRAME_EXIT) {
+		TBXR_ApplyLifecycleAction(&gAppState, VRL_ACT_EXIT_APP);
+	}
+	gAppState.SessionActive = gLife.running ? GL_TRUE : GL_FALSE;
+	gAppState.Focused = gLife.focused != 0;
+	return verdict != VRL_FRAME_OK;
+}
+
 //All the stuff we want to do each frame
 void TBXR_FrameSetup()
 {
@@ -1390,22 +1582,64 @@ void TBXR_FrameSetup()
 		return;
 	}
 
-	while (!destroyed)
+	// Wait until the runtime says the session can render (READY handled, xrBeginSession done).
+	// This blocks the engine thread on purpose while the headset is asleep: the game does not
+	// advance in standby.  Events are polled with a short sleep (the old loop spun at 100% CPU and
+	// had no exit for EXITING / LOSS_PENDING / a destroyed Activity).
 	{
-		TBXR_ProcessMessageQueue();
+		double start = TBXR_GetTimeInMilliSeconds();
+		int lastLogMs = -1;
+		int wasWaiting = 0;
 
-		if (ovrApp_HandleXrEvents(&gAppState))
+		for (;;)
 		{
-			TBXR_Recenter();
-		}
+			vrlWait_t w = VrLife_WaitDecision(&gLife, destroyed);
+			int waited = (int)(TBXR_GetTimeInMilliSeconds() - start);
 
-		if (gAppState.SessionActive == GL_FALSE)
+			if (w == VRL_WAIT_PROCEED)
+			{
+				break;
+			}
+			if (w == VRL_WAIT_EXIT)
+			{
+				if (destroyed)
+				{
+					TBXR_LeaveVR();
+					exit(0);
+				}
+				usleep(20000);      // clean shutdown already requested; wait for the process to end
+				return;
+			}
+			if (w == VRL_WAIT_RECREATE)
+			{
+				gRecreatePending = 1;
+				return;             // RTCWVR_FrameSetup rebuilds the session at the start of the next frame
+			}
+
+			if (!wasWaiting)
+			{
+				TBXR_LogLifecycleStatus("render thread waiting (session not running)");
+				wasWaiting = 1;
+				lastLogMs = 0;
+			}
+			else if (VrLife_WaitLogDue(waited, lastLogMs, 5000))
+			{
+				TBXR_LogLifecycleStatus("still waiting");
+				lastLogMs = waited;
+			}
+			TBXR_ProcessMessageQueue();
+			if (ovrApp_HandleXrEvents(&gAppState))
+			{
+				TBXR_Recenter();
+			}
+			usleep(5000);
+		}
+		if (wasWaiting)
 		{
-			continue;
+			TBXR_LogLifecycleStatus("render thread resumed");
 		}
-
-		break;
 	}
+
 	for (int i = 0; !destroyed && !gAppState.Focused && i < 250; ++i)
 	{
 		TBXR_ProcessMessageQueue();
@@ -1415,30 +1649,43 @@ void TBXR_FrameSetup()
 			TBXR_Recenter();
 		}
 
-		if (gAppState.Focused)
+		if (gAppState.Focused || !VrLife_CanRender(&gLife))
 		{
 			break;
 		}
 
 		usleep(1000);
 	}
-    if (destroyed)
-    {
+	if (destroyed)
+	{
 		TBXR_LeaveVR();
 
 		exit(0);
+	}
+	if (!VrLife_CanRender(&gLife))
+	{
+		return;     // the state changed while waiting for focus: do not touch a stopped session
 	}
 
 	memset(&gAppState.FrameState, 0, sizeof(XrFrameState));
 	gAppState.FrameState.type = XR_TYPE_FRAME_STATE;
 	XrResult waitResult;
 	OXR(waitResult = xrWaitFrame(gAppState.Session, NULL, &gAppState.FrameState));
+	if (TBXR_FrameCallFailed("xrWaitFrame", waitResult))
+	{
+		gAppState.FrameState.predictedDisplayTime = 0;
+		return;
+	}
 
 	XrFrameBeginInfo beginFrameDesc = {0};
 	beginFrameDesc.type = XR_TYPE_FRAME_BEGIN_INFO;
 	beginFrameDesc.next = NULL;
 	XrResult beginResult;
 	OXR(beginResult = xrBeginFrame(gAppState.Session, &beginFrameDesc));
+	if (TBXR_FrameCallFailed("xrBeginFrame", beginResult))
+	{
+		return;
+	}
 
 	//Game specific frame setup stuff called here
 	VR_FrameSetup();
@@ -1451,6 +1698,7 @@ void TBXR_FrameSetup()
 
 	gAppState.FrameSetup = true;
 	gAppState.FinishedEyeMask = 0;
+	gAppState.AcquiredEyeMask = 0;
 }
 
 int TBXR_GetRefresh()
@@ -1493,6 +1741,9 @@ void TBXR_prepareEyeBuffer(int eye)
 	vr.eye = eye;
 	ovrFramebuffer* frameBuffer = &(gAppState.Renderer.FrameBuffer[eye]);
 	ovrFramebuffer_Acquire(frameBuffer);
+	if (frameBuffer->Acquired) {
+		gAppState.AcquiredEyeMask |= (1u << eye);
+	}
 	ovrFramebuffer_SetCurrent(frameBuffer);
 	TBXR_ClearFrameBuffer(frameBuffer->ColorSwapChain.Width, frameBuffer->ColorSwapChain.Height);
 
@@ -1564,11 +1815,19 @@ void TBXR_submitFrame()
 	if (gAppState.SessionActive == GL_FALSE || !gAppState.FrameSetup) {
 		return;
 	}
+	if (!VrLife_CanRender(&gLife)) {
+		// the session stopped or was lost while this frame was being rendered: never submit
+		gAppState.FrameSetup = false;
+		gAppState.FinishedEyeMask = 0;
+		gAppState.AcquiredEyeMask = 0;
+		return;
+	}
 
 	const uint32_t requiredMask = VR_UseScreenLayer() ? 0x1u : 0x3u;
 	if ((gAppState.FinishedEyeMask & requiredMask) != requiredMask) {
 		return;
 	}
+	const bool imagesAcquired = (gAppState.AcquiredEyeMask & requiredMask) == requiredMask;
 
 	//Calculate the maximum extent fov for use in culling in the engine (we won't want to cull inside this fov)
 	vr.fov_x = (fabs(gAppState.Views[0].fov.angleLeft) + fabs(gAppState.Views[1].fov.angleRight)) * 180.0f / M_PI;
@@ -1670,11 +1929,19 @@ void TBXR_submitFrame()
 		layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&quad_layer;
 	}
 
+	if (!imagesAcquired) {
+		// a swapchain image could not be acquired: end the frame without layers rather than
+		// submitting images the runtime never handed out
+		layerCount = 0;
+	}
 	endFrameInfo.layerCount = layerCount;
-	OXR(xrEndFrame(gAppState.Session, &endFrameInfo));
+	XrResult endResult;
+	OXR(endResult = xrEndFrame(gAppState.Session, &endFrameInfo));
+	TBXR_FrameCallFailed("xrEndFrame", endResult);
 
 	gAppState.FrameSetup = false;
 	gAppState.FinishedEyeMask = 0;
+	gAppState.AcquiredEyeMask = 0;
 }
 
 

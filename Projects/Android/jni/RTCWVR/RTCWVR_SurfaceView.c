@@ -10,6 +10,8 @@
 #include "TBXR_Common.h"
 #include "VrCvars.h"
 #include "VrInput.h"
+#include "VrLifecycleLogic.h"
+#include "VrLifecycleLog.h"
 
 #include "../rtcw/src/client/client.h"
 #include "../rtcw/src/qcommon/qcommon.h"
@@ -76,6 +78,10 @@ static jmethodID android_haptic_enable;
 static jmethodID android_haptic_disable;
 
 static void RTCWVR_JniShutdown(void);
+static pthread_mutex_t gWindowLock = PTHREAD_MUTEX_INITIALIZER;
+static volatile int gAppThreadStarted;
+static volatile int gExitRequested;
+extern vrLifecycle_t gLife;
 
 static char **argv;
 static int argc;
@@ -210,7 +216,29 @@ static qboolean RTCWVR_WaitForAndroidSurface(void)
 	for (int i = 0; i < 200 && (gAppThread.NativeWindow == NULL || !gAppThread.Resumed); ++i) {
 		usleep(10000);
 	}
+	if (gAppThread.NativeWindow == NULL || !gAppThread.Resumed) {
+		// not fatal: the OpenXR session does not need the Android window; startup goes on
+		RTCWLife_Log("startup: no resumed Activity/Surface after 2 s (window=%p resumed=%d); continuing",
+					 (void*)gAppThread.NativeWindow, (int)gAppThread.Resumed);
+	}
 	return (gAppThread.NativeWindow != NULL && gAppThread.Resumed);
+}
+
+// Clean application exit requested by the lifecycle logic (session EXITING, instance loss,
+// unrecoverable failures).  The Java side ends the process; this is NOT a seamless resume.
+void RTCWVR_RequestAppExit(const char *reason)
+{
+	if (gExitRequested) {
+		return;
+	}
+	gExitRequested = 1;
+	RTCWLife_Log("application exit requested (%s)", reason ? reason : "?");
+	if (jniCallbackObj != NULL && android_shutdown != NULL) {
+		RTCWVR_JniShutdown();
+	} else {
+		RTCWLife_Log("no Activity callback available: exiting the process directly");
+		exit(0);
+	}
 }
 
 static void RTCWVR_InitSharedState(void)
@@ -265,15 +293,25 @@ void RTCWVR_InitOnce(void)
 		if (ctx == vrGlContext) {
 			return;
 		}
+		RTCWLife_Log("GL context changed (%p -> %p): session objects are rebuilt", vrGlContext, ctx);
 		TBXR_DestroySessionForReinit();
 		vrInitialised = qfalse;
+	} else if (gAppState.Session != XR_NULL_HANDLE) {
+		// an earlier attempt stopped half way (session lost while waiting): start from a clean state
+		TBXR_DestroySessionForReinit();
 	}
 
 	GlInitExtensions();
-	TBXR_EnterVR();
+	if (!TBXR_EnterVR()) {
+		TBXR_OnSessionCreateFailed();
+		return;
+	}
 	TBXR_InitRenderer();
 	TBXR_InitActions();
-	TBXR_WaitForSessionActive();
+	TBXR_OnSessionCreated();
+	if (!TBXR_WaitForSessionActive()) {
+		return;     // lost or shutting down; the next frame rebuilds (or the process ends)
+	}
 
 	vrInitialised = qtrue;
 	vrGlContext = ctx;
@@ -478,6 +516,15 @@ void VR_HandleControllerInput(void)
 
 void RTCWVR_FrameSetup(void)
 {
+	if (TBXR_RecreatePending()) {
+		// the session was lost (or its swapchains became unusable): rebuild on this thread, which owns the GL context
+		TBXR_ClearRecreatePending();
+		if (vrPreInitialised && gAppState.Instance != XR_NULL_HANDLE) {
+			RTCWLife_Log("rebuilding the OpenXR session (recovery)");
+			TBXR_DestroySessionForReinit();
+			vrInitialised = qfalse;
+		}
+	}
 	RTCWVR_InitOnce();
 	RTCWVR_UpdateScreenLayer();
 	TBXR_FrameSetup();
@@ -680,6 +727,14 @@ int JNI_OnLoad(JavaVM *vm, void *reserved)
 JNIEXPORT jlong JNICALL Java_com_drbeef_rtcwquest_GLES3JNILib_onCreate(JNIEnv *env, jclass activityClass, jobject activity,
 																	   jstring commandLineParams)
 {
+	RTCWLife_Log("jni onCreate (app thread already started: %d)", (int)gAppThreadStarted);
+	if (gAppThreadStarted) {
+		// A second Activity instance in a process whose engine thread is still alive. Starting
+		// another engine thread would run two engines on the same globals, so reuse the first one.
+		RTCWLife_Log("onCreate ignored: the engine thread is already running");
+		return (jlong)(size_t)&gAppThread;
+	}
+
 	(*env)->GetJavaVM(env, &gAppThread.JavaVm);
 	gAppThread.ActivityObject = (*env)->NewGlobalRef(env, activity);
 	gAppThread.ActivityClass = (*env)->NewGlobalRef(env, activityClass);
@@ -697,6 +752,7 @@ JNIEXPORT jlong JNICALL Java_com_drbeef_rtcwquest_GLES3JNILib_onCreate(JNIEnv *e
 	}
 
 	initialize_gl4es();
+	gAppThreadStarted = 1;
 	pthread_create(&gAppThread.Thread, NULL, RTCWVR_AppThread, NULL);
 	return (jlong)(size_t)&gAppThread;
 }
@@ -704,8 +760,14 @@ JNIEXPORT jlong JNICALL Java_com_drbeef_rtcwquest_GLES3JNILib_onCreate(JNIEnv *e
 JNIEXPORT void JNICALL Java_com_drbeef_rtcwquest_GLES3JNILib_onStart(JNIEnv *env, jobject obj, jlong handle, jobject activity)
 {
 	(void)handle;
-	jniCallbackObj = (*env)->NewGlobalRef(env, activity);
-	jclass callbackClass = (*env)->GetObjectClass(env, jniCallbackObj);
+	RTCWLife_Log("jni onStart");
+	// onStart runs again after every onStop. Keep one global reference per Activity instance; the old
+	// code created a new one each time (a leak) while the engine thread was using the previous one.
+	if (jniCallbackObj != NULL && (*env)->IsSameObject(env, jniCallbackObj, activity)) {
+		return;
+	}
+	jobject newRef = (*env)->NewGlobalRef(env, activity);
+	jclass callbackClass = (*env)->GetObjectClass(env, newRef);
 	android_shutdown = (*env)->GetMethodID(env, callbackClass, "shutdown", "()V");
 	android_haptic_event = (*env)->GetMethodID(env, callbackClass, "haptic_event", "(Ljava/lang/String;IIIFF)V");
 	android_haptic_updateevent = (*env)->GetMethodID(env, callbackClass, "haptic_updateevent", "(Ljava/lang/String;IF)V");
@@ -713,48 +775,82 @@ JNIEXPORT void JNICALL Java_com_drbeef_rtcwquest_GLES3JNILib_onStart(JNIEnv *env
 	android_haptic_endframe = (*env)->GetMethodID(env, callbackClass, "haptic_endframe", "()V");
 	android_haptic_enable = (*env)->GetMethodID(env, callbackClass, "haptic_enable", "()V");
 	android_haptic_disable = (*env)->GetMethodID(env, callbackClass, "haptic_disable", "()V");
+	(*env)->DeleteLocalRef(env, callbackClass);
+	{
+		jobject old = jniCallbackObj;
+
+		jniCallbackObj = newRef;
+		if (old != NULL) {
+			(*env)->DeleteGlobalRef(env, old);
+		}
+	}
 }
 
 JNIEXPORT void JNICALL Java_com_drbeef_rtcwquest_GLES3JNILib_onResume(JNIEnv *env, jobject obj, jlong handle)
 {
 	(void)env; (void)obj; (void)handle;
 	gAppThread.Resumed = true;
+	TBXR_NoteAndroidLifecycle(1);
+	RTCWLife_Log("jni onResume: xr=%s running=%d surface=%d", VrLife_StateName(gLife.xrState), gLife.running, gLife.surfaceId);
 }
 
 JNIEXPORT void JNICALL Java_com_drbeef_rtcwquest_GLES3JNILib_onPause(JNIEnv *env, jobject obj, jlong handle)
 {
 	(void)env; (void)obj; (void)handle;
 	gAppThread.Resumed = false;
+	TBXR_NoteAndroidLifecycle(0);
+	RTCWLife_Log("jni onPause: xr=%s running=%d surface=%d", VrLife_StateName(gLife.xrState), gLife.running, gLife.surfaceId);
 }
 
 JNIEXPORT void JNICALL Java_com_drbeef_rtcwquest_GLES3JNILib_onStop(JNIEnv *env, jobject obj, jlong handle)
 {
 	(void)env; (void)obj; (void)handle;
+	RTCWLife_Log("jni onStop: xr=%s running=%d", VrLife_StateName(gLife.xrState), gLife.running);
 }
 
 JNIEXPORT void JNICALL Java_com_drbeef_rtcwquest_GLES3JNILib_onDestroy(JNIEnv *env, jobject obj, jlong handle)
 {
 	(void)obj; (void)handle;
+	RTCWLife_Log("jni onDestroy: xr=%s running=%d", VrLife_StateName(gLife.xrState), gLife.running);
+	// Tell the engine thread: it leaves its wait loops and shuts the process down (it used to keep
+	// running without an Activity, and a relaunch then started a second engine thread).
+	TBXR_NotifyActivityDestroyed();
+
+	pthread_mutex_lock(&gWindowLock);
 	if (gAppThread.NativeWindow) {
 		ANativeWindow_release(gAppThread.NativeWindow);
 		gAppThread.NativeWindow = NULL;
 	}
-	if (jniCallbackObj) {
-		(*env)->DeleteGlobalRef(env, jniCallbackObj);
-		jniCallbackObj = NULL;
-	}
+	gAppState.NativeWindow = NULL;
+	pthread_mutex_unlock(&gWindowLock);
+	// jniCallbackObj stays valid on purpose: the engine thread may still call haptics/shutdown
+	// while it exits; the process ends right after.
 }
 
 JNIEXPORT void JNICALL Java_com_drbeef_rtcwquest_GLES3JNILib_onSurfaceCreated(JNIEnv *env, jobject obj, jlong handle, jobject surface)
 {
 	(void)obj; (void)handle;
-	if (gAppThread.NativeWindow) {
-		ANativeWindow_release(gAppThread.NativeWindow);
-		gAppThread.NativeWindow = NULL;
+	ANativeWindow *window = ANativeWindow_fromSurface(env, surface);
+
+	pthread_mutex_lock(&gWindowLock);
+	if (window != NULL && window == gAppThread.NativeWindow) {
+		// surfaceChanged for the surface we already hold: nothing to release or re-acquire
+		pthread_mutex_unlock(&gWindowLock);
+		ANativeWindow_release(window);       // drop the extra reference from ANativeWindow_fromSurface
+		RTCWLife_Log("jni onSurfaceChanged: same window %p (no change)", (void*)window);
+		return;
 	}
-	gAppThread.NativeWindow = ANativeWindow_fromSurface(env, surface);
-	gAppState.NativeWindow = gAppThread.NativeWindow;
+	if (gAppThread.NativeWindow) {
+		RTCWLife_Log("jni surface: replacing window %p with %p", (void*)gAppThread.NativeWindow, (void*)window);
+		ANativeWindow_release(gAppThread.NativeWindow);
+	}
+	gAppThread.NativeWindow = window;
+	gAppState.NativeWindow = window;
 	gAppState.NativeWindowChanged = true;
+	pthread_mutex_unlock(&gWindowLock);
+
+	TBXR_NoteSurface((int)(size_t)window);
+	RTCWLife_Log("jni onSurfaceCreated: window=%p", (void*)window);
 }
 
 JNIEXPORT void JNICALL Java_com_drbeef_rtcwquest_GLES3JNILib_onSurfaceChanged(JNIEnv *env, jobject obj, jlong handle, jobject surface)
@@ -765,10 +861,15 @@ JNIEXPORT void JNICALL Java_com_drbeef_rtcwquest_GLES3JNILib_onSurfaceChanged(JN
 JNIEXPORT void JNICALL Java_com_drbeef_rtcwquest_GLES3JNILib_onSurfaceDestroyed(JNIEnv *env, jobject obj, jlong handle)
 {
 	(void)env; (void)obj; (void)handle;
+	pthread_mutex_lock(&gWindowLock);
 	if (gAppThread.NativeWindow) {
 		ANativeWindow_release(gAppThread.NativeWindow);
 		gAppThread.NativeWindow = NULL;
 	}
 	gAppState.NativeWindow = NULL;
 	gAppState.NativeWindowChanged = true;
+	pthread_mutex_unlock(&gWindowLock);
+	TBXR_NoteSurface(0);
+	RTCWLife_Log("jni onSurfaceDestroyed: window released; XR session state=%s running=%d (rendering does not depend on it)",
+				 VrLife_StateName(gLife.xrState), gLife.running);
 }

@@ -188,6 +188,13 @@ Edited game files were syntax-checked with host gcc against the real headers (`-
    MISSING: ...`), `merc models` full report, refusal if nothing qualifies. Offline: `tools/inventory_rtcw_models.py` (tested on synthetic pk3)
    and `tools/Inventory-RtcwModels.ps1` (port, **not executed**). Tests: `tests/vr_gameplay` 544 checks.
 
+### M3 hotfix 2B: sleep/resume (owner report: black screen / freeze / launcher after standby)
+Root cause not proven. Source defects found and fixed: asserts in the session-state handler (abort), LOSS_PENDING/EXITING/instance loss ignored,
+busy-wait loops, unbounded `xrWaitSwapchainImage`, ignored frame-call results, `destroyed` never set + a second engine thread on relaunch,
+JNI global-ref leak, wake lock held while paused, `exit(1)` on session creation failure, local-space leak. New `VrLifecycleLogic.h` (pure, 94 host checks,
+12 mutations killed), logging tag `RTCWLifecycle`, hardware plan in `docs/M3_GAMEPLAY_MERCENARY.md` section 3b. **Unverified on hardware.**
+Removed: the `OpenXRTestWakeLock` (kept `FLAG_KEEP_SCREEN_ON`).
+
 ### Not done / unknown
 - Whether the Partisan model is complete on the owner's install (probed at runtime; see `merc models` / logcat).
 - Whether the notebook corner button that opens the "Private bucket list" page is reachable in VR (`visible 2`, unverified).

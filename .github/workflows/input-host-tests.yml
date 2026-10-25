@@ -2,7 +2,8 @@ name: Input Host Tests
 
 # Fast host-side tests for the controller input logic and diagnostics
 # (tests/vr_input) and for the single-player gameplay additions: God Mode and
-# the mercenary companion decision logic (tests/vr_gameplay).
+# the mercenary companion decision logic (tests/vr_gameplay), and the OpenXR session / Android
+# lifecycle decisions (tests/vr_lifecycle).
 # No Android SDK/NDK needed; runs in a few seconds.
 # This does NOT replace the Android Debug APK build and proves nothing about
 # runtime behaviour on a headset.
@@ -12,6 +13,8 @@ on:
     paths:
       - 'tests/vr_input/**'
       - 'tests/vr_gameplay/**'
+      - 'tests/vr_lifecycle/**'
+      - 'Projects/Android/jni/RTCWVR/VrLifecycleLogic.h'
       - 'Projects/Android/jni/rtcw/src/game/g_vrlogic.h'
       - 'Projects/Android/jni/RTCWVR/VrInputLogic.h'
       - 'Projects/Android/jni/RTCWVR/VrInputDiag.c'
@@ -34,3 +37,6 @@ jobs:
 
       - name: Gameplay (God Mode, mercenary) host tests
         run: make -C tests/vr_gameplay test
+
+      - name: Lifecycle (OpenXR session, Android pause/resume) host tests
+        run: make -C tests/vr_lifecycle test

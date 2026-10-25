@@ -63,6 +63,13 @@ import static android.system.Os.setenv;
 	private HapticServiceClient externalHapticsServiceClient = null;
 
 	private static final String TAG = "RTCWQuest";
+	// Lifecycle diagnostics, same tag as the native side (adb logcat -s RTCWLifecycle:I)
+	private static final String LIFE = "RTCWLifecycle";
+
+	private static void life(String what)
+	{
+		Log.i( LIFE, "v1 java " + what + " thread=" + Thread.currentThread().getName() );
+	}
 	private static final String APPLICATION = "RTCWQuest";
 
 	private boolean permissionsGranted = false;
@@ -287,7 +294,6 @@ import static android.system.Os.setenv;
 		}
 
 		getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-		acquireTestWakeLock();
 
 		//Make the directories
 		new File("/sdcard/RTCWQuest/Main").mkdirs();
@@ -370,23 +376,14 @@ import static android.system.Os.setenv;
 		}
 	}
 
-	private void acquireTestWakeLock() {
-		if (mWakeLock == null) {
-			PowerManager powerManager = (PowerManager)getSystemService(Context.POWER_SERVICE);
-			if (powerManager != null) {
-				mWakeLock = powerManager.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK,
-						"RTCWQuest:OpenXRTestWakeLock");
-				mWakeLock.setReferenceCounted(false);
-			}
-		}
-		if (mWakeLock != null && !mWakeLock.isHeld()) {
-			mWakeLock.acquire();
-		}
-	}
-
+	// An OpenXR bring-up "test" wake lock used to be acquired in onResume and only released in
+	// onDestroy. It kept the screen awake while the app was paused and blocked normal idle standby,
+	// which made the sleep/resume behaviour untestable. It is no longer acquired anywhere; this
+	// only releases one in case an older build left it held.
 	private void releaseTestWakeLock() {
 		if (mWakeLock != null && mWakeLock.isHeld()) {
 			mWakeLock.release();
+			life("released a stale wake lock");
 		}
 	}
 
@@ -435,6 +432,7 @@ import static android.system.Os.setenv;
 	@Override protected void onStart()
 	{
 		Log.v( TAG, "GLES3JNIActivity::onStart()" );
+		life( "onStart handle=" + mNativeHandle );
 		super.onStart();
 
 		if ( mNativeHandle != 0 )
@@ -446,8 +444,8 @@ import static android.system.Os.setenv;
 	@Override protected void onResume()
 	{
 		Log.v( TAG, "GLES3JNIActivity::onResume()" );
+		life( "onResume handle=" + mNativeHandle );
 		super.onResume();
-		acquireTestWakeLock();
 
 		if ( mNativeHandle != 0 )
 		{
@@ -458,6 +456,7 @@ import static android.system.Os.setenv;
 	@Override protected void onPause()
 	{
 		Log.v( TAG, "GLES3JNIActivity::onPause()" );
+		life( "onPause handle=" + mNativeHandle + " finishing=" + isFinishing() );
 		if ( mNativeHandle != 0 )
 		{
 			GLES3JNILib.onPause(mNativeHandle);
@@ -468,6 +467,7 @@ import static android.system.Os.setenv;
 	@Override protected void onStop()
 	{
 		Log.v( TAG, "GLES3JNIActivity::onStop()" );
+		life( "onStop handle=" + mNativeHandle );
 		if ( mNativeHandle != 0 )
 		{
 			GLES3JNILib.onStop(mNativeHandle);
@@ -478,6 +478,7 @@ import static android.system.Os.setenv;
 	@Override protected void onDestroy()
 	{
 		Log.v( TAG, "GLES3JNIActivity::onDestroy()" );
+		life( "onDestroy handle=" + mNativeHandle + " finishing=" + isFinishing() + " changingConfig=" + isChangingConfigurations() );
 		releaseTestWakeLock();
 
 		if ( mSurfaceHolder != null )
@@ -501,6 +502,7 @@ import static android.system.Os.setenv;
 	@Override public void surfaceCreated( SurfaceHolder holder )
 	{
 		Log.v( TAG, "GLES3JNIActivity::surfaceCreated()" );
+		life( "surfaceCreated surface=" + System.identityHashCode( holder.getSurface() ) + " valid=" + holder.getSurface().isValid() );
 		mSurfaceHolder = holder;
 		if ( mNativeHandle != 0 )
 		{
@@ -511,6 +513,7 @@ import static android.system.Os.setenv;
 	@Override public void surfaceChanged( SurfaceHolder holder, int format, int width, int height )
 	{
 		Log.v( TAG, "GLES3JNIActivity::surfaceChanged()" );
+		life( "surfaceChanged surface=" + System.identityHashCode( holder.getSurface() ) + " " + width + "x" + height + " format=" + format );
 		mSurfaceHolder = holder;
 		if ( mNativeHandle != 0 )
 		{
@@ -521,6 +524,7 @@ import static android.system.Os.setenv;
 	@Override public void surfaceDestroyed( SurfaceHolder holder )
 	{
 		Log.v( TAG, "GLES3JNIActivity::surfaceDestroyed()" );
+		life( "surfaceDestroyed handle=" + mNativeHandle );
 		if ( mNativeHandle != 0 )
 		{
 			GLES3JNILib.onSurfaceDestroyed( mNativeHandle );

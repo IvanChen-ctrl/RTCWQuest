@@ -270,10 +270,84 @@ Per candidate (what the code expects; "exact missing resource" comes from the lo
 4. If it still says "no compatible soldier model", send `run.log` and the inventory report: the exact missing paths decide the next step.
 5. Run `merc models` once and send the log as well (shows non-native model folders that qualify).
 
+## 3b. Hotfix 2: sleep / standby / resume stability (PICO 4)
+
+Reported: after the headset sleeps or enters standby, waking it can give a persistent black screen, a frozen game, a return to the launcher or an exit.
+Nothing below is hardware-verified; the **root cause is not proven**. "Confirmed" means read from the source; the causes are ranked hypotheses.
+
+### Confirmed defects in the source (lifecycle trace)
+```
+Android onPause/onStop -> JNI (only sets gAppThread.Resumed) -> OpenXR events polled ONLY inside TBXR_FrameSetup / TBXR_WaitForSessionActive
+ -> READY: xrBeginSession   STOPPING: xrEndSession   (FOCUSED/VISIBLE only toggled a flag)   LOSS_PENDING, EXITING, SYNCHRONIZED, IDLE: ignored
+ -> Surface destroyed/created: release + re-acquire the ANativeWindow (also on every surfaceChanged)
+```
+| # | Defect (file) | Effect |
+|---|---|---|
+| 1 | `ovrApp_HandleSessionStateChanges` used `assert()` (`TBXR_Common.c`): READY asserts "not active", STOPPING asserts "active". Debug APKs keep asserts. | A STOPPING without a running session (e.g. after a failed `xrBeginSession`) or a duplicate READY **aborts the process** -> "returns to the launcher". |
+| 2 | `XR_SESSION_STATE_LOSS_PENDING` and `EXITING` were ignored, instance loss only logged at verbose level. | After a lost session/instance the engine waits for a READY that never comes: **black screen, frozen**. |
+| 3 | `TBXR_FrameSetup` / `TBXR_WaitForSessionActive` waited with a **busy loop** (no sleep, no exit condition other than a flag nobody set). | 100% CPU spin while asleep; no way out on EXITING/loss. |
+| 4 | `ovrFramebuffer_Acquire` retried `xrWaitSwapchainImage` **forever** on `XR_TIMEOUT_EXPIRED`, without looking at the session state. | If standby arrives between `xrBeginFrame` and the swapchain wait, the engine thread never returns to the event loop that would process STOPPING: **freeze**. |
+| 5 | Results of `xrWaitFrame` / `xrBeginFrame` / `xrEndFrame` were ignored; frames were rendered and ended on a session that was not running. | Error spam, undefined behaviour after loss. |
+| 6 | `destroyed` (Activity gone) was never set, so the engine thread kept running after `onDestroy`; a relaunch in the same process called `onCreate` again and **started a second engine thread** on the same globals. | Black/frozen relaunch ("needs restart"). |
+| 7 | `onStart` created a new JNI global reference every time (leak) and replaced the object the engine thread was using for haptics. | Leak + race after each stop/start. |
+| 8 | `onSurfaceChanged` was routed through `onSurfaceCreated`: window released and re-acquired on every call; `GLES3JNIActivity` also held a `SCREEN_BRIGHT_WAKE_LOCK` ("OpenXRTestWakeLock") from `onResume` until `onDestroy`, i.e. **also while paused**. | Window churn; a wake lock fighting the standby the user is testing. |
+| 9 | `TBXR_EnterVR` called `exit(1)` if `xrCreateSession` failed; `TBXR_Recenter` leaked the local space each call. | Abrupt exit instead of a bounded retry; space leak on every recenter/recreate. |
+
+Not a defect (checked): the GL context is an EGL **pbuffer** context created by the app (`ovrEgl_CreateContext`), and OpenXR renders into swapchain
+images, so the Android Surface/window is not part of the graphics path; surface callbacks arriving late or never cannot invalidate swapchains.
+
+### Hypotheses (not confirmed; the new logs separate them)
+H1 STOPPING/READY ordering plus asserts -> abort (defect 1). H2 standby mid-frame -> endless swapchain wait (4). H3 session or instance loss after a long standby ->
+no recovery (2, 3). H4 wake-lock / stale engine thread interplay (6, 8). The process-vs-freeze test below tells which family happened.
+
+### What changed
+- **`VrLifecycleLogic.h`** (pure, host tested): the session state machine. READY -> begin (never on lost/invalid graphics, never twice); STOPPING -> end (no assert);
+  IDLE with a running session resynchronises; LOSS_PENDING / session lost -> destroy and recreate on the engine thread; EXITING / instance loss -> clean exit;
+  frame-call results decide skip / recreate / exit; bounded retries (3 begin failures, 3 recreate failures, 5 swapchain timeouts) end in a **clean exit**, not a frozen screen.
+- **`TBXR_Common.c`:** events drive that logic (stale events of a destroyed session are ignored); the waits sleep 5 ms, log every 5 s and end on exit/loss/destroy;
+  no frame is begun, rendered or submitted unless the session is running; a frame whose swapchain image could not be acquired is ended without layers;
+  swapchain waits poll the session state and give up (then the session objects are rebuilt); `TBXR_EnterVR` returns failure instead of `exit(1)`; recenter no longer leaks the local space;
+  controller and haptic calls are skipped while the session is not running.
+- **`RTCWVR_SurfaceView.c`:** `onDestroy` tells the engine thread to leave and shut down; a second `onCreate` does not start a second engine thread; one JNI global reference per Activity instance;
+  the window pointer is guarded by a mutex and an unchanged `surfaceChanged` is a no-op; `RTCWVR_RequestAppExit` ends the process through the Activity.
+- **`GLES3JNIActivity.java`:** no wake lock any more (`FLAG_KEEP_SCREEN_ON` while the Activity is on top is unchanged); every callback is logged.
+- **Not done on purpose:** no permanent wake lock, no background render loop, no attempt to keep the game running while the headset sleeps (the engine thread blocks in standby, the game does not advance).
+
+### What cannot be promised
+- If Android kills the process while the app is in the background, the next launch is a fresh start (the game continues from your last save). That is not resumable and the logs will show a new process id.
+- Instance loss (`INSTANCE_LOSS_PENDING`) is handled by a clean exit, not by rebuilding the instance.
+- Recovery from a lost session recreates the session, swapchains and actions on the same EGL context; it has not been exercised against a real runtime.
+
+### Diagnostics (`adb logcat -s RTCWLifecycle:I`)
+One line per event, never per frame: `v1 t=<ms> <message>` (native) and `v1 java <event> thread=<name>` (Activity). Events: Android callbacks (with Surface identity, `finishing`,
+`changingConfig`), JNI callbacks, `xr session state -> X action=...`, `xrBeginSession/xrEndSession/xrCreateSession result=`, `xrWaitFrame/xrBeginFrame/xrEndFrame result=` (only when it changes),
+`xrWaitSwapchainImage timeout #n`, `render thread waiting / still waiting / resumed` with a status line (`xr= running= focused= visible= lost= exit= gfx= android_resumed= surface=`),
+`session recreate requested`, `destroying session`, `rebuilding the OpenXR session (recovery)`, `application exit requested (...)`.
+
+### Hardware plan: sleep / resume
+Setup: install the APK from this branch, `adb logcat -c; adb logcat -v time -s RTCWLifecycle:I RTCW:I RTCWVR:E AndroidRuntime:E DEBUG:F > life.log`. Note `adb shell pidof com.drbeef.rtcwquest` before each test.
+
+| # | Test | Expected log (order of Android vs XR lines may differ) | Success criteria |
+|---|---|---|---|
+| 1 | Main menu, press the power button / take the headset off, wait 30 s, wake | `onPause`, `xr session state -> VISIBLE`, `SYNCHRONIZED`, `STOPPING action=end`, `xrEndSession result=0`, `IDLE`; waking: `onResume`, `READY action=begin`, `xrBeginSession result=0`, `render thread resumed`, `FOCUSED` | Menu visible, cursor and clicks work, same pid. |
+| 2 | In a level, standing still, sleep 30 s, wake | same as 1 | Game continues where it was (it did not advance while asleep), controls work, no black screen. |
+| 3 | God Mode on (notebook page), sleep/wake | same as 1 | `vr_godmode` still on (damage ignored), HUD health consistent. |
+| 4 | 10 consecutive sleep/wake cycles (10-20 s each) | 10 x the sequence of 1; `beginCount = endCount + 1` pattern (every `xrEndSession` has a following `xrBeginSession`) | No growth in CPU/memory, no `session recreate`, every wake renders. |
+| 5 | Leave idle 10+ minutes asleep, wake | as 1; possibly `LOSS_PENDING`/`recreate` lines | Recovers; if the process was killed the pid changed (document it, not a failure of this fix). |
+| 6 | Open the PICO system menu (Home button) and return | `VISIBLE` <-> `FOCUSED` (no STOPPING needed) | Game stays rendered behind the menu, input returns on FOCUSED. |
+| 7 | Switch to another app (if the system allows) and back | `onPause/onStop` ... `onStart/onResume` as 1 | Same as 1, `jni onStart` does not add references (no growth). |
+| 8 | During test 2, repeat while shooting/loading a level (sleep mid-frame) | possible `xrWaitSwapchainImage timeout` lines then `giving up on swapchain`, `rebuilding the OpenXR session` | Game recovers after wake; if not, send `life.log`. |
+
+**Process crash versus frozen process** (after a failed wake):
+- `adb shell pidof com.drbeef.rtcwquest` empty or a different number than before => the process died (crash, kill or clean exit). Look for `Fatal signal`, `AndroidRuntime`, `application exit requested`, `Process ... died`, `adb logcat -b crash -d`.
+- Same pid but black/frozen => a surviving process. `life.log` shows `still waiting` every 5 s with the XR state: `IDLE` for ever = the runtime never sent READY (system issue); `READY`/`running=0` = begin failed (see `xrBeginSession result`); no lines at all = the engine thread is blocked somewhere else (send `adb shell top -H -n 1 -p <pid>` and `adb logcat -d`).
+- Black screen and `running=1 focused=1` with frames: a rendering problem, not lifecycle.
+
 ## 4. Tests
 
 ```
 make -C tests/vr_input test       # 139 checks (98 existing + 41 new for jump/diagnostics)
+make -C tests/vr_lifecycle test   # 94 checks: OpenXR session state machine, Android pause/resume, surface identity, loss/exit, bounded retries
 make -C tests/vr_gameplay test    # 544 checks: God Mode, hire rules, spawn candidates, friend/foe, state machine,
                                   #             stall watchdog, auto re-hire policy
 ```

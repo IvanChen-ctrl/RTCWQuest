@@ -122,7 +122,7 @@ typedef struct {
 double TBXR_GetTimeInMilliSeconds(void);
 int TBXR_GetRefresh(void);
 void TBXR_InitialiseOpenXR(void);
-void TBXR_EnterVR(void);
+qboolean TBXR_EnterVR(void);
 void TBXR_InitRenderer(void);
 void TBXR_InitActions(void);
 void TBXR_UpdateControllers(void);
