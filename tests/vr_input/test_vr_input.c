@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "VrInputLogic.h"
+#include "VrCrouchLogic.h"
 #include "VrInputDiag.h"
 
 /* Engine-side key codes as the diagnostics module sees them in host mode. */
@@ -407,6 +408,253 @@ static void test_jump_selects_same_button_as_crouch_partner(void)
     CHECK((VrInput_ComposeButtons(VRI_HAND_LEFT, &left) & VRI_BTN_B) == 0);
 }
 
+
+/* ===================== crouch (A button) ===================== */
+
+static void test_duck_press_and_release(void)
+{
+    vrDuckState_t st;
+
+    memset(&st, 0, sizeof(st));
+    CHECK(VrInput_DuckStep(&st, 0, 0) == VRI_DUCK_NONE);
+    CHECK(VrInput_DuckStep(&st, 1, 0) == VRI_DUCK_PRESS);
+    CHECK(VrInput_DuckStep(&st, 1, 0) == VRI_DUCK_NONE);        /* held: exactly one +movedown */
+    CHECK(VrInput_DuckStep(&st, 1, 0) == VRI_DUCK_NONE);
+    CHECK(VrInput_DuckStep(&st, 0, 0) == VRI_DUCK_RELEASE);
+    CHECK(VrInput_DuckStep(&st, 0, 0) == VRI_DUCK_NONE);
+}
+
+static void test_duck_repeated_presses(void)
+{
+    vrDuckState_t st;
+    int i, presses = 0, releases = 0;
+
+    memset(&st, 0, sizeof(st));
+    for (i = 0; i < 20; i++) {
+        int a = VrInput_DuckStep(&st, (i % 4) < 2, 0);
+
+        presses += (a == VRI_DUCK_PRESS);
+        releases += (a == VRI_DUCK_RELEASE);
+    }
+    CHECK(presses == 5);
+    CHECK(releases == 5 || releases == 4);      /* the last release may not have happened yet */
+    CHECK(presses - releases == st.held);       /* never unbalanced */
+}
+
+static void test_duck_blocked_press_is_ignored_not_replayed(void)
+{
+    vrDuckState_t st;
+
+    memset(&st, 0, sizeof(st));
+    CHECK(VrInput_DuckStep(&st, 1, 1) == VRI_DUCK_IGNORED);     /* backpack zone / menu */
+    CHECK(VrInput_DuckStep(&st, 1, 1) == VRI_DUCK_NONE);
+    CHECK(VrInput_DuckStep(&st, 1, 0) == VRI_DUCK_NONE);        /* block ends, A still held: no late crouch */
+    CHECK(VrInput_DuckStep(&st, 0, 0) == VRI_DUCK_NONE);        /* and nothing to release */
+    CHECK(VrInput_DuckStep(&st, 1, 0) == VRI_DUCK_PRESS);       /* a fresh press works */
+}
+
+/* The old code could leave +movedown stuck when the hand entered the backpack zone or a menu opened
+ * while A was held.  The release is now always sent. */
+static void test_duck_held_is_released_when_blocked(void)
+{
+    vrDuckState_t st;
+
+    memset(&st, 0, sizeof(st));
+    CHECK(VrInput_DuckStep(&st, 1, 0) == VRI_DUCK_PRESS);
+    CHECK(VrInput_DuckStep(&st, 1, 1) == VRI_DUCK_FORCED_RELEASE);  /* menu opened with A held */
+    CHECK(st.held == 0);
+    CHECK(VrInput_DuckStep(&st, 1, 1) == VRI_DUCK_NONE);
+    CHECK(VrInput_DuckStep(&st, 1, 0) == VRI_DUCK_NONE);            /* not re-pressed by itself */
+    CHECK(VrInput_DuckStep(&st, 0, 0) == VRI_DUCK_NONE);            /* releasing later sends nothing extra */
+}
+
+static void test_duck_release_after_block_when_button_let_go(void)
+{
+    vrDuckState_t st;
+
+    memset(&st, 0, sizeof(st));
+    CHECK(VrInput_DuckStep(&st, 1, 0) == VRI_DUCK_PRESS);
+    CHECK(VrInput_DuckStep(&st, 0, 1) == VRI_DUCK_RELEASE);         /* released while blocked: still sent */
+}
+
+/* Never stuck: for any press/block sequence the number of +movedown minus -movedown ends at 0 or 1
+ * and equals `held`; after the button is up and a step ran, held is 0. */
+static void test_duck_never_stuck_for_any_sequence(void)
+{
+    unsigned seq;
+
+    for (seq = 0; seq < 4096; seq++) {
+        vrDuckState_t st;
+        int i, balance = 0;
+
+        memset(&st, 0, sizeof(st));
+        for (i = 0; i < 6; i++) {
+            int down = (seq >> (2 * i)) & 1, blocked = (seq >> (2 * i + 1)) & 1;
+            int a = VrInput_DuckStep(&st, down, blocked);
+
+            balance += (a == VRI_DUCK_PRESS) - (a == VRI_DUCK_RELEASE || a == VRI_DUCK_FORCED_RELEASE);
+            CHECK(balance == st.held);
+            CHECK(balance >= 0 && balance <= 1);
+        }
+        VrInput_DuckStep(&st, 0, 0);
+        CHECK(st.held == 0);
+    }
+}
+
+/* Crouch and jump are independent machines: any interleaving keeps both consistent. */
+static void test_crouch_and_jump_are_independent(void)
+{
+    vrDuckState_t duck;
+    vrJumpState_t jump;
+    vrJumpAction_t ja;
+    int i;
+
+    memset(&duck, 0, sizeof(duck));
+    memset(&jump, 0, sizeof(jump));
+    /* A down, B down, B up, A up */
+    CHECK(VrInput_DuckStep(&duck, 1, 0) == VRI_DUCK_PRESS);
+    CHECK(VrInput_JumpStep(&jump, 1, 0, 0, 0, &ja) == 1 && ja.down == 1);
+    CHECK(VrInput_DuckStep(&duck, 1, 0) == VRI_DUCK_NONE);                 /* B did not touch the crouch */
+    CHECK(VrInput_JumpStep(&jump, 0, 0, 0, 0, &ja) == 1 && ja.down == 0);
+    CHECK(duck.held == 1);                                                 /* still crouching */
+    CHECK(VrInput_DuckStep(&duck, 0, 0) == VRI_DUCK_RELEASE);
+    CHECK(jump.heldRoute == VRI_JUMP_ROUTE_NONE);
+
+    /* a menu opening releases both, independently */
+    CHECK(VrInput_DuckStep(&duck, 1, 0) == VRI_DUCK_PRESS);
+    CHECK(VrInput_JumpStep(&jump, 1, 0, 0, 0, &ja) == 1);
+    CHECK(VrInput_DuckStep(&duck, 1, 1) == VRI_DUCK_FORCED_RELEASE);
+    CHECK(VrInput_JumpStep(&jump, 1, 1, 0, 0, &ja) == 1 && ja.down == 0);
+    for (i = 0; i < 3; i++) {
+        CHECK(VrInput_DuckStep(&duck, 0, 1) == VRI_DUCK_NONE);
+    }
+}
+
+/* Whole pipeline on the host: raw OpenXR face1 -> composed Buttons -> the crouch button bit the
+ * input handler tests -> state machine.  Right hand default layout = A; sticks switched = X. */
+static void test_crouch_pipeline_from_raw_hand_input(void)
+{
+    vrRawHandInput_t right, left;
+    vrDuckState_t st;
+    uint32_t dominant, off, primary;
+
+    memset(&right, 0, sizeof(right));
+    memset(&left, 0, sizeof(left));
+    memset(&st, 0, sizeof(st));
+
+    right.face1 = 1;                                  /* PICO 4 A */
+    dominant = VrInput_ComposeButtons(VRI_HAND_RIGHT, &right);
+    off = VrInput_ComposeButtons(VRI_HAND_LEFT, &left);
+    CHECK((dominant & VRI_BTN_A) != 0);
+    CHECK((dominant & VRI_BTN_B) == 0);               /* A is not the jump button */
+    primary = dominant;                               /* default: primary hand is the dominant one */
+    CHECK(VrInput_DuckStep(&st, (primary & VRI_BTN_A) != 0, 0) == VRI_DUCK_PRESS);
+
+    right.face1 = 0;
+    dominant = VrInput_ComposeButtons(VRI_HAND_RIGHT, &right);
+    CHECK(VrInput_DuckStep(&st, (dominant & VRI_BTN_A) != 0, 0) == VRI_DUCK_RELEASE);
+
+    /* switched sticks: the off hand (left) is primary and its face1 is X */
+    left.face1 = 1;
+    off = VrInput_ComposeButtons(VRI_HAND_LEFT, &left);
+    CHECK((off & VRI_BTN_X) != 0);
+    CHECK(VrInput_DuckStep(&st, (off & VRI_BTN_X) != 0, 0) == VRI_DUCK_PRESS);
+    CHECK(VrInput_DuckStep(&st, 0, 0) == VRI_DUCK_RELEASE);
+    /* the other hand's A/X pressed in the wrong layout does not crouch */
+    left.face1 = 0;
+    right.face1 = 1;
+    off = VrInput_ComposeButtons(VRI_HAND_LEFT, &left);
+    dominant = VrInput_ComposeButtons(VRI_HAND_RIGHT, &right);
+    CHECK((dominant & VRI_BTN_A) != 0);
+    CHECK(VrInput_DuckStep(&st, (off & VRI_BTN_X) != 0, 0) == VRI_DUCK_NONE);
+}
+
+static void test_duck_button_source_names(void)
+{
+    CHECK(strcmp(VrInput_DuckButtonName(0, 1), "A") == 0);      /* default, right-handed */
+    CHECK(strcmp(VrInput_DuckButtonName(1, 1), "X") == 0);      /* sticks switched */
+    CHECK(strcmp(VrInput_DuckButtonName(0, 0), "X") == 0);      /* left-handed scheme */
+    CHECK(strcmp(VrInput_DuckButtonName(1, 0), "A") == 0);
+}
+
+static void test_crouch_diag_lines(void)
+{
+    resetDiag();
+    VrInputDiag_Crouch(VRI_DUCK_PRESS, "A", "gameplay", 1);
+    VrInputDiag_Crouch(VRI_DUCK_RELEASE, "A", "gameplay", 1);
+    VrInputDiag_Crouch(VRI_DUCK_FORCED_RELEASE, "A", "menu", 0);
+    VrInputDiag_Crouch(VRI_DUCK_IGNORED, "X", "backpack", 1);
+    CHECK(linesContain("ev=crouch action=pressed button_source=A game_state=gameplay irl=1"));
+    CHECK(linesContain("ev=crouch action=released button_source=A game_state=gameplay irl=1"));
+    CHECK(linesContain("ev=crouch action=forced_release button_source=A game_state=menu irl=0"));
+    CHECK(linesContain("ev=crouch action=ignored button_source=X game_state=backpack irl=1"));
+}
+
+/* ---- player height rule (shared with bg_pmove.c) ---- */
+#define STAND 48
+#define CROUCH 24
+
+static void test_crouch_height_button_forces_crouch_when_standing(void)
+{
+    /* the reported bug: standing upright (cur == max), IRL crouch on, A pressed -> must crouch */
+    CHECK(VrCrouch_ComputeHeight(0, 1.7f, 1.7f, 0.65f, STAND, CROUCH) == STAND);
+    CHECK(VrCrouch_ComputeHeight(1, 1.7f, 1.7f, 0.65f, STAND, CROUCH) == CROUCH);
+}
+
+static void test_crouch_height_button_released_stands_again(void)
+{
+    CHECK(VrCrouch_ComputeHeight(1, 1.7f, 1.7f, 0.65f, STAND, CROUCH) == CROUCH);
+    CHECK(VrCrouch_ComputeHeight(0, 1.7f, 1.7f, 0.65f, STAND, CROUCH) == STAND);
+}
+
+static void test_crouch_height_irl_crouch_still_works(void)
+{
+    /* crouching in real life, no button */
+    CHECK(VrCrouch_ComputeHeight(0, 1.0f, 1.7f, 0.65f, STAND, CROUCH) == CROUCH);      /* below the ratio */
+    {
+        int mid = VrCrouch_ComputeHeight(0, 1.5f, 1.7f, 0.65f, STAND, CROUCH);
+
+        CHECK(mid > CROUCH && mid < STAND);                                          /* proportional */
+    }
+    CHECK(VrCrouch_ComputeHeight(0, 1.8f, 1.7f, 0.65f, STAND, CROUCH) == STAND);       /* taller than calibrated */
+    /* button plus real crouch: still the crouched height, never lower */
+    CHECK(VrCrouch_ComputeHeight(1, 1.0f, 1.7f, 0.65f, STAND, CROUCH) == CROUCH);
+}
+
+static void test_crouch_height_edge_cases(void)
+{
+    /* uncalibrated (maxHeight 0) and degenerate ratios must not divide by zero or underflow */
+    CHECK(VrCrouch_ComputeHeight(0, 0.0f, 0.0f, 0.65f, STAND, CROUCH) == STAND);
+    CHECK(VrCrouch_ComputeHeight(1, 0.0f, 0.0f, 0.65f, STAND, CROUCH) == CROUCH);
+    CHECK(VrCrouch_ComputeHeight(0, 1.0f, 1.7f, 1.0f, STAND, CROUCH) == CROUCH);       /* ratio 1: below max is crouched */
+    CHECK(VrCrouch_ComputeHeight(0, 1.7f, 1.7f, 1.0f, STAND, CROUCH) == STAND);
+    {
+        int h = VrCrouch_ComputeHeight(0, 1.69f, 1.7f, 1.0f, STAND, CROUCH);
+
+        CHECK(h >= CROUCH && h <= STAND);
+    }
+    /* a class with no crouch height (crouch >= stand) never changes */
+    CHECK(VrCrouch_ComputeHeight(1, 1.7f, 1.7f, 0.65f, 48, 48) == 48);
+    CHECK(VrCrouch_ComputeHeight(1, 1.0f, 1.7f, 0.65f, 48, 60) == 48);
+}
+
+static void test_crouch_height_is_always_within_bounds(void)
+{
+    int duck;
+    float cur;
+
+    for (duck = 0; duck < 2; duck++) {
+        for (cur = 0.0f; cur < 2.5f; cur += 0.05f) {
+            int h = VrCrouch_ComputeHeight(duck, cur, 1.7f, 0.65f, STAND, CROUCH);
+
+            CHECK(h >= CROUCH && h <= STAND);
+            if (duck) {
+                CHECK(h == CROUCH);
+            }
+        }
+    }
+}
+
 static void test_diag_line_format(void)
 {
     resetDiag();
@@ -644,6 +892,22 @@ int main(void)
     test_jump_while_moving_is_independent_of_stick();
     test_jump_selects_same_button_as_crouch_partner();
     test_jump_diag_line();
+
+    test_duck_press_and_release();
+    test_duck_repeated_presses();
+    test_duck_blocked_press_is_ignored_not_replayed();
+    test_duck_held_is_released_when_blocked();
+    test_duck_release_after_block_when_button_let_go();
+    test_duck_never_stuck_for_any_sequence();
+    test_crouch_and_jump_are_independent();
+    test_crouch_pipeline_from_raw_hand_input();
+    test_duck_button_source_names();
+    test_crouch_diag_lines();
+    test_crouch_height_button_forces_crouch_when_standing();
+    test_crouch_height_button_released_stands_again();
+    test_crouch_height_irl_crouch_still_works();
+    test_crouch_height_edge_cases();
+    test_crouch_height_is_always_within_bounds();
 
     test_diag_line_format();
     test_diag_disabled_is_silent();

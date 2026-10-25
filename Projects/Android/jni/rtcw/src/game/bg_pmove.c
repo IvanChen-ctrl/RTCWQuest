@@ -35,6 +35,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "bg_public.h"
 #include "bg_local.h"
 #include "../../../RTCWVR/VrClientInfo.h"
+#include "../../../RTCWVR/VrCrouchLogic.h"
 
 // Rafael gameskill
 int bg_pmove_gameskill_integer;
@@ -1662,18 +1663,11 @@ static void PM_CheckDuck( void ) {
 		vr->viewHeight = pm->ps->standViewHeight; // 40
 
 		// Compute in-game height based on HMD height above floor
-		// (adjust height only when crouching, ignore IRL jumps)
-		int computedHeight = standHeight;
-		if (crouchHeight < standHeight && vr->curHeight < vr->maxHeight) {
-			// Count minimum IRL crouch height based on maximum IRL height
-			float minHeight = vr->maxHeight * vr->vrIrlCrouchToStandRatio;
-			if (vr->curHeight < minHeight) { // Do not allow to crawl (set min height)
-				computedHeight = crouchHeight;
-			} else {
-				float heightRatio = (vr->curHeight - minHeight) / (vr->maxHeight - minHeight);
-				computedHeight = crouchHeight + (int)(heightRatio * (standHeight - crouchHeight));
-			}
-		}
+		// (adjust height only when crouching, ignore IRL jumps).  The crouch button
+		// (usercmd upmove < 0, +movedown) forces the crouched height: before M4 this branch
+		// returned without ever reading the button, so A did not crouch with IRL crouch on.
+		int computedHeight = VrCrouch_ComputeHeight(pm->cmd.upmove < 0, vr->curHeight, vr->maxHeight,
+													vr->vrIrlCrouchToStandRatio, standHeight, crouchHeight);
 
 		// Adjust height based on where are you standing
 		// (cannot stand up if there is no place, find nearest possible height)

@@ -202,4 +202,59 @@ static inline int VrInput_JumpStep(vrJumpState_t *st, int buttonDown, int blocke
     return 0;
 }
 
+/* ---- Crouch (A button on the dominant hand, X when sticks are switched) ----
+ *
+ * Hold semantics (the engine's +movedown / -movedown, as before M4).  The old code sent both
+ * edges only while the backpack zone was inactive, so a press made while the hand was in the
+ * zone was lost and a release made after the hand entered it was never sent (stuck crouch).
+ * Same rules as the jump: the release always matches the press and is sent even when the
+ * crouch becomes blocked; a press that starts while blocked is never replayed. */
+#define VRI_DUCK_NONE            0
+#define VRI_DUCK_PRESS           1   /* send +movedown                                    */
+#define VRI_DUCK_RELEASE         2   /* send -movedown (button let go)                    */
+#define VRI_DUCK_FORCED_RELEASE  3   /* send -movedown (menu / backpack took over)        */
+#define VRI_DUCK_IGNORED         4   /* press edge while blocked: nothing sent (log only) */
+
+typedef struct {
+    int held;        /* +movedown has been sent and not yet released */
+    int prevDown;
+} vrDuckState_t;
+
+static inline int VrInput_DuckStep(vrDuckState_t *st, int buttonDown, int blocked)
+{
+    int pressEdge = buttonDown && !st->prevDown;
+
+    st->prevDown = buttonDown ? 1 : 0;
+
+    if (!buttonDown) {
+        if (st->held) {
+            st->held = 0;
+            return VRI_DUCK_RELEASE;
+        }
+        return VRI_DUCK_NONE;
+    }
+    if (blocked) {
+        if (st->held) {
+            st->held = 0;
+            return VRI_DUCK_FORCED_RELEASE;
+        }
+        return pressEdge ? VRI_DUCK_IGNORED : VRI_DUCK_NONE;
+    }
+    if (pressEdge) {
+        st->held = 1;
+        return VRI_DUCK_PRESS;
+    }
+    return VRI_DUCK_NONE;
+}
+
+/* Name of the physical button that drives the crouch, for diagnostics.
+ * The crouch uses the "primary" button 1: the dominant hand's, or the other hand's when sticks
+ * are switched.  Right hand = A, left hand = X. */
+static inline const char *VrInput_DuckButtonName(int switchSticks, int rightHandedDominant)
+{
+    int primaryIsRight = switchSticks ? !rightHandedDominant : rightHandedDominant;
+
+    return primaryIsRight ? "A" : "X";
+}
+
 #endif /* VRINPUTLOGIC_H */

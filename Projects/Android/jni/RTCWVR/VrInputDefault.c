@@ -28,6 +28,28 @@ static inline float AngleBetweenVectors(const vec3_t a, const vec3_t b)
 
 void Sys_QueEvent( int time, sysEventType_t type, int value, int value2, int ptrLength, void *ptr );
 
+// Crouch button state machine (see VrInputLogic.h and VrCrouchLogic.h).  Called every frame, in
+// gameplay and (blocked) in menus, so the release always matches the press.  blockedWhy names the
+// game state for the diagnostics.
+static vrDuckState_t duckState;
+
+static void sendDuck(int buttonDown, int blocked, const char *gameState)
+{
+    int action = VrInput_DuckStep(&duckState, buttonDown, blocked);
+
+    if (action == VRI_DUCK_NONE) {
+        return;
+    }
+    VrInputDiag_Crouch(action, VrInput_DuckButtonName(vr_switch_sticks->integer, vr.right_handed), gameState,
+                       vr.vrIrlCrouchEnabled ? 1 : 0);
+    if (action == VRI_DUCK_IGNORED) {
+        return;
+    }
+    sendButtonAction("+movedown", action == VRI_DUCK_PRESS);
+    // Reset max height for IRL crouch (recalibrate the standing height), as before
+    vr.maxHeight = 0;
+}
+
 // Jump button state machine (see VrInputLogic.h).  Called every frame, in gameplay and
 // (with blocked set) in menus, so a held jump is always released and a press made
 // while blocked is never replayed later.
@@ -179,6 +201,7 @@ void HandleInput_Default( ovrInputStateGamepad *pFootTrackingNew, ovrInputStateG
         handleTrackedControllerButton(pDominantTrackedRemoteNew, pDominantTrackedRemoteOld, domButton2, K_ESCAPE);
         // Keep the jump state current and release a jump held while the menu opened.
         sendJump((primaryButtonsNew & primaryButton2) != 0, 1);
+        sendDuck((primaryButtonsNew & primaryButton1) != 0, 1, "menu");
         if (vr_menu_item_touched->integer) {
             RTCWVR_Vibrate(40, vr.menu_right_handed ? 1 : 0, 0.5);
             Cvar_SetValue("vr_menu_item_touched", 0);
@@ -620,15 +643,12 @@ void HandleInput_Default( ovrInputStateGamepad *pFootTrackingNew, ovrInputStateG
                 }
             }
 
-            //Duck
-            if (vr.backpackitemactive != 2 &&
-                !canUseBackpack &&
-                (primaryButtonsNew & primaryButton1) !=
-                (primaryButtonsOld & primaryButton1)) {
+            //Duck (A button, X when sticks are switched): hold to crouch
+            {
+                int duckBlocked = (vr.backpackitemactive == 2 || canUseBackpack);
 
-                sendButtonAction("+movedown", (primaryButtonsNew & primaryButton1));
-                // Reset max height for IRL crouch
-                vr.maxHeight = 0;
+                sendDuck((primaryButtonsNew & primaryButton1) != 0, duckBlocked,
+                         duckBlocked ? "backpack" : "gameplay");
             }
 
 			//Weapon Chooser

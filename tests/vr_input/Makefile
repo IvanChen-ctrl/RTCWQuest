@@ -12,7 +12,7 @@ BIN := build/test_vr_input
 test: $(BIN)
 	./$(BIN)
 
-$(BIN): test_vr_input.c $(JNI_VR)/VrInputDiag.c $(JNI_VR)/VrInputDiag.h $(JNI_VR)/VrInputLogic.h
+$(BIN): test_vr_input.c $(JNI_VR)/VrInputDiag.c $(JNI_VR)/VrInputDiag.h $(JNI_VR)/VrInputLogic.h $(JNI_VR)/VrCrouchLogic.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) test_vr_input.c $(JNI_VR)/VrInputDiag.c -o $(BIN)
 
